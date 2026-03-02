@@ -124,7 +124,12 @@ def compute_gae(
 
 class ReinforceAgent:
     """
-    Vanilla REINFORCE with optional baseline (mean return).
+    Vanilla REINFORCE with optional baseline (mean return) and entropy regularisation.
+
+    ent_coef : weight on entropy bonus — keep high early to prevent mode collapse,
+               anneal to ~0 over training (set agent.ent_coef externally).
+    epsilon  : prob of taking a uniformly-random legal action (epsilon-greedy).
+               Anneal to 0 over training (set agent.epsilon externally).
     """
 
     def __init__(
@@ -134,15 +139,30 @@ class ReinforceAgent:
         lr: float = 3e-4,
         gamma: float = 0.99,
         hidden: int = 128,
+        ent_coef: float = 0.05,
+        epsilon: float = 0.1,
         device: str = "cpu",
     ):
         self.gamma = gamma
+        self.ent_coef = ent_coef
+        self.epsilon = epsilon
         self.device = device
         self.net = PolicyNetwork(obs_dim, act_dim, hidden).to(device)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
 
     def select_action(self, obs: np.ndarray, mask: np.ndarray):
-        return self.net.get_action(obs, mask, self.device)
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        mask_t = torch.tensor(mask, dtype=torch.float32, device=self.device).unsqueeze(0)
+        with torch.no_grad():
+            logits, value = self.net(obs_t, mask_t)
+            dist = Categorical(logits=logits)
+            if self.epsilon > 0 and np.random.random() < self.epsilon:
+                legal = np.where(mask)[0]
+                action_t = torch.tensor([int(np.random.choice(legal))], device=self.device)
+            else:
+                action_t = dist.sample()
+            log_prob = dist.log_prob(action_t)
+        return action_t.item(), log_prob.item(), value.item()
 
     def update(self, buffer: RolloutBuffer) -> dict:
         obs_t, act_t, rew_t, done_t, old_lp_t, val_t, mask_t = buffer.to_tensors(self.device)
@@ -165,17 +185,20 @@ class ReinforceAgent:
         logits, _ = self.net(obs_t, mask_t)
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(act_t)
+        entropy = dist.entropy().mean()
 
-        # Policy loss: -E[log π(a|s) * (G - b)]
+        # Policy loss: -E[log π(a|s) * (G - b)] - ent_coef * H[π]
         policy_loss = -(log_probs * (returns - baseline)).mean()
+        loss = policy_loss - self.ent_coef * entropy
 
         self.optimizer.zero_grad()
-        policy_loss.backward()
+        loss.backward()
         nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
         self.optimizer.step()
 
         return {
             "policy_loss": policy_loss.item(),
+            "entropy": entropy.item(),
             "mean_return": returns.mean().item(),
         }
 
@@ -200,7 +223,7 @@ class PPOAgent:
         epochs: int = 4,
         minibatch_size: int = 64,
         vf_coef: float = 0.5,
-        ent_coef: float = 0.01,
+        ent_coef: float = 0.05,
         hidden: int = 128,
         device: str = "cpu",
     ):
@@ -210,7 +233,7 @@ class PPOAgent:
         self.epochs = epochs
         self.minibatch_size = minibatch_size
         self.vf_coef = vf_coef
-        self.ent_coef = ent_coef
+        self.ent_coef = ent_coef   # anneal externally: agent.ent_coef = ...
         self.device = device
 
         self.net = PolicyNetwork(obs_dim, act_dim, hidden).to(device)
