@@ -36,8 +36,8 @@ from lib.visualize import (
 def get_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
-    if torch.backends.mps.is_available():
-        return "mps"
+    # MPS is slower than CPU for this model size (per-step sync overhead
+    # dominates the small batched-update speedup), so we skip it.
     return "cpu"
 
 DEVICE = get_device()
