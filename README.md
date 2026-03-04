@@ -692,3 +692,58 @@ python train.py --policy cnn --value linear
 8. **Diagnostics are non-negotiable**: Without explained variance, value calibration, reward decomposition, and entropy tracking, the root causes of training failures would have been invisible.
 
 9. **Configurability enables experimentation**: Having `--policy` and `--value` CLI flags lets us quickly ablate architectural choices without code changes.
+
+---
+
+## 11. Latest Empirical Snapshot (2026-03-04)
+
+This section summarises the latest generated reports and plots in this repo:
+
+- `reports/reinforce_report_value_mlp/report.md`
+- `reports/ppo_report/report.md` (PPO CNN + linear value)
+- `reports/ppo_report_value_mlp/report.md` (PPO CNN + MLP value)
+
+### 11.1 Headline Comparison (last-iteration metrics)
+
+| Model | Reward (last) | Lines (last) | Fixed eval reward (last) | Fixed eval lines (last) |
+|------|---------------:|-------------:|--------------------------:|------------------------:|
+| REINFORCE (MLP) | -107.20 | 0.00 | -74.46 | 0.70 |
+| PPO (CNN + linear value) | 162.63 | 3.79 | 84.56 | 2.70 |
+| PPO (CNN + MLP value) | 337.63 | 5.89 | 266.06 | 5.50 |
+
+### 11.2 What Changed When Switching Linear -> MLP Critic (PPO)
+
+Keeping PPO policy as CNN and replacing only the critic architecture in the compared runs:
+
+- Reward improved from `162.63` to `337.63` (about `2.08x`).
+- Lines improved from `3.79` to `5.89` (about `1.55x`).
+- Fixed-seed eval reward improved from `84.56` to `266.06` (about `3.15x`).
+- Fixed-seed eval lines improved from `2.70` to `5.50` (about `2.04x`).
+
+Note: this is strong practical evidence, but not a perfectly isolated critic-only ablation, because late-training controls also differ between the two saved runs (for example `target_kl` appears in the MLP-value config).
+
+Critic/stability diagnostics also improved:
+
+- Explained variance (last): `0.130 -> 0.329`.
+- Approx KL (last): `0.049 -> 0.014`.
+- Clip fraction (last): `0.315 -> 0.118`.
+- Ratio max (last): `8.37 -> 4.40`.
+
+### 11.3 Plot-Based Observations (Current Run)
+
+From the latest core/diagnostic plots:
+
+- Reward, lines, and episode length are still rising at iteration 300 (no clear plateau yet).
+- Fixed-seed evaluation shows a strong late improvement near the final checkpoints.
+- Value loss increases over time, but explained variance also rises in late training; this indicates larger return scale with improved relative fit, not necessarily critic collapse.
+- Entropy decays gradually (toward ~1.0), while KL and clip fraction remain in a conservative range for most late iterations.
+- Top-out rate remains high (~0.91), so there is still significant room to improve board safety and long-horizon stability.
+
+### 11.4 Storytelling Assets Generated
+
+The report pipeline now saves comparison GIFs for qualitative analysis:
+
+- `gif_random_vs_reinforce.gif`
+- `gif_reinforce_vs_ppo.gif`
+
+These are embedded directly in report markdown and are generated with a median-performance seed by default for less cherry-picked storytelling.
