@@ -139,7 +139,7 @@ def train_reinforce():
         "entropy": [], "policy_loss": [], "gradient_norm": [],
         "per_piece_rewards": {n: [] for n in PIECE_NAMES},
         "board_holes": [], "board_bumpiness": [], "board_max_height": [],
-        # reward decomposition (per-episode totals)
+        # reward decomposition (per-step mean)
         "reward_line_clear": [], "reward_survival": [],
         "reward_hole_penalty": [], "reward_hole_removal": [],
         "reward_bump_penalty": [], "reward_height_penalty": [],
@@ -200,6 +200,11 @@ def train_reinforce():
         board_stats = compute_board_stats(env)
         stats = agent.update(buf)
         topped_out = env.board[0].any()  # top row occupied = topped out
+
+        # Normalize reward components to per-step mean
+        if ep_steps > 0:
+            for k in rc:
+                rc[k] /= ep_steps
 
         # Store metrics
         metrics["rewards"].append(ep_reward)
@@ -265,7 +270,8 @@ def train_ppo():
     EPOCHS        = 4
     MINIBATCH     = 256
     N_FILTERS     = 32
-    VALUE_REG     = 1e-4
+    VALUE_LR      = 1e-3
+    TARGET_KL     = 0.02
     ENT_START, ENT_END = 0.20, 0.02
     SNAPSHOT_EVERY = 50
 
@@ -275,8 +281,8 @@ def train_ppo():
         board_h=BOARD_H, board_w=BOARD_W, num_pieces=NUM_PIECES,
         lr=LR, gamma=GAMMA, lam=LAM, clip_eps=CLIP_EPS,
         epochs=EPOCHS, minibatch_size=MINIBATCH, ent_coef=ENT_START,
-        n_filters=N_FILTERS, hidden=HIDDEN, value_reg=VALUE_REG,
-        device=DEVICE,
+        n_filters=N_FILTERS, hidden=HIDDEN, value_lr=VALUE_LR,
+        target_kl=TARGET_KL, device=DEVICE,
     )
 
     FIXED_EVAL_EVERY = 50
@@ -289,11 +295,11 @@ def train_ppo():
         "policy_loss": [], "value_loss": [], "entropy": [], "gradient_norm": [],
         "advantage_mean": [], "advantage_std": [], "advantage_min": [], "advantage_max": [],
         "ratio_mean": [], "ratio_max": [], "clip_fraction": [],
-        "explained_variance": [], "approx_kl": [],
+        "explained_variance": [], "approx_kl": [], "epochs_completed": [],
         "ep_length_mean": [], "ep_length_std": [],
         "board_holes_mean": [], "board_bumpiness_mean": [], "board_max_height_mean": [],
         "per_piece_rewards": {n: [] for n in PIECE_NAMES},
-        # Reward decomposition (per-iteration averages across completed episodes)
+        # Reward decomposition (per-step mean, averaged across completed episodes)
         "reward_line_clear": [], "reward_survival": [],
         "reward_hole_penalty": [], "reward_hole_removal": [],
         "reward_bump_penalty": [], "reward_height_penalty": [],
@@ -364,7 +370,12 @@ def train_ppo():
                 ep_rewards_iter.append(cur_rew)
                 ep_lines_iter.append(cur_lines)
                 ep_steps_iter.append(cur_steps)
-                ep_reward_components.append(dict(cur_rc))
+                # Normalize reward components to per-step mean
+                if cur_steps > 0:
+                    normalized_rc = {k: v / cur_steps for k, v in cur_rc.items()}
+                else:
+                    normalized_rc = dict(cur_rc)
+                ep_reward_components.append(normalized_rc)
                 iter_n_episodes += 1
                 if env.board[0].any():
                     iter_topouts += 1
@@ -394,7 +405,7 @@ def train_ppo():
         for key in ["policy_loss", "value_loss", "entropy", "gradient_norm",
                      "advantage_mean", "advantage_std", "advantage_min", "advantage_max",
                      "ratio_mean", "ratio_max", "clip_fraction", "explained_variance",
-                     "approx_kl"]:
+                     "approx_kl", "epochs_completed"]:
             k_stats = "grad_norm" if key == "gradient_norm" else key
             metrics[key].append(stats.get(k_stats, 0.0))
 
@@ -477,7 +488,8 @@ def train_ppo():
         "lr": LR, "gamma": GAMMA, "lam": LAM, "clip_eps": CLIP_EPS,
         "epochs": EPOCHS, "minibatch_size": MINIBATCH, "hidden": HIDDEN,
         "n_filters": N_FILTERS, "ent_start": ENT_START, "ent_end": ENT_END,
-        "n_iters": N_ITERS, "rollout_steps": ROLLOUT_STEPS, "value_reg": VALUE_REG,
+        "n_iters": N_ITERS, "rollout_steps": ROLLOUT_STEPS,
+        "value_lr": VALUE_LR, "target_kl": TARGET_KL,
     }
     return agent, metrics, snapshots, hyperparams
 
@@ -608,7 +620,7 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     ]
     for label, vals, color in components:
         ax.plot(smooth(vals, 10), label=label, color=color, linewidth=1.5, alpha=0.8)
-    ax.set_title("PPO: Reward Decomposition (per-episode avg)")
+    ax.set_title("PPO: Reward Decomposition (per-step mean)")
     ax.set_xlabel("Iteration"); ax.set_ylabel("Reward Component")
     ax.legend(loc="best"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(str(GIF_DIR / "ppo_reward_decomposition.png"), dpi=120)
@@ -627,7 +639,7 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     ]
     for label, vals, color in rf_components:
         ax.plot(smooth(vals, 30), label=label, color=color, linewidth=1.5, alpha=0.8)
-    ax.set_title("REINFORCE: Reward Decomposition (per-episode)")
+    ax.set_title("REINFORCE: Reward Decomposition (per-step mean)")
     ax.set_xlabel("Episode"); ax.set_ylabel("Reward Component")
     ax.legend(loc="best"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); fig.savefig(str(GIF_DIR / "reinforce_reward_decomposition.png"), dpi=120)
@@ -692,12 +704,11 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     singles = ppo_metrics.get("singles", [])
     if singles:
         fig, ax = plt.subplots(figsize=(12, 5))
-        x = range(len(singles))
-        ax.stackplot(x,
-                     smooth(singles, 10),
-                     smooth(ppo_metrics["doubles"], 10),
-                     smooth(ppo_metrics["triples"], 10),
-                     smooth(ppo_metrics["quads"], 10),
+        s1 = smooth(singles, 10)
+        s2 = smooth(ppo_metrics["doubles"], 10)
+        s3 = smooth(ppo_metrics["triples"], 10)
+        s4 = smooth(ppo_metrics["quads"], 10)
+        ax.stackplot(range(len(s1)), s1, s2, s3, s4,
                      labels=["Singles", "Doubles", "Triples", "Quads"],
                      colors=["#3498db", "#2ecc71", "#e67e22", "#e74c3c"],
                      alpha=0.8)

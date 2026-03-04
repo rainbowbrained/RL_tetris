@@ -176,6 +176,58 @@ class LinearValueEstimator:
         self.w = d["w"].copy()
 
 
+class MLPValueEstimator(nn.Module):
+    """
+    V(s) via a small MLP trained with Adam.
+
+    Architecture:  obs_dim → hidden1 → ReLU → hidden2 → ReLU → 1
+    Trained per-rollout alongside the policy (separate optimizer).
+    """
+
+    def __init__(self, obs_dim: int, hidden1: int = 128, hidden2: int = 64,
+                 lr: float = 1e-3, device: str = "cpu"):
+        super().__init__()
+        self.device = device
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden1),
+            nn.ReLU(),
+            nn.Linear(hidden1, hidden2),
+            nn.ReLU(),
+            nn.Linear(hidden2, 1),
+        ).to(device)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
+
+    def forward(self, obs_t: torch.Tensor) -> torch.Tensor:
+        """obs_t: (N, obs_dim) → (N,)"""
+        return self.net(obs_t).squeeze(-1)
+
+    def predict(self, obs: np.ndarray) -> np.ndarray:
+        """Predict values for a batch. obs: (N, obs_dim) → (N,) float32."""
+        with torch.no_grad():
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+            vals = self.forward(obs_t)
+        return vals.cpu().numpy().astype(np.float32)
+
+    def predict_single(self, obs: np.ndarray) -> float:
+        """Predict value for one observation. obs: (obs_dim,) → scalar."""
+        with torch.no_grad():
+            obs_t = torch.as_tensor(
+                obs, dtype=torch.float32, device=self.device
+            ).unsqueeze(0)
+            val = self.forward(obs_t)
+        return val.item()
+
+    def train_on_batch(self, obs_t: torch.Tensor, returns_t: torch.Tensor) -> float:
+        """One SGD step on MSE loss. Returns loss value."""
+        pred = self.forward(obs_t)
+        loss = F.mse_loss(pred, returns_t)
+        self.optimizer.zero_grad()
+        loss.backward()
+        nn.utils.clip_grad_norm_(self.parameters(), 0.5)
+        self.optimizer.step()
+        return loss.item()
+
+
 # ──────────────────────────────────────────────────────────────
 # Rollout Buffer
 # ──────────────────────────────────────────────────────────────
@@ -362,14 +414,16 @@ class PPOAgent:
     Architecture
     ------------
     • Policy  – CNN reads the raw board (1×H×W) + piece one-hots → logits
-    • Value   – Linear model V(s) = w^T φ(s) + b  on the 35-dim flat features,
-                fitted once per rollout by closed-form ridge regression (least
-                squares).  No gradient descent, no shared backbone.
+    • Value   – MLP V(s) on the 35-dim flat features, trained with Adam
+                (separate optimizer, separate backward pass).
 
     Separating policy and value this way:
       1. Eliminates the gradient conflict in a shared backbone
       2. Gives the policy a spatial (CNN) inductive bias for the grid
-      3. Keeps value estimation simple and numerically stable
+      3. Lets the value function learn nonlinear patterns independently
+
+    Target-KL early stopping: if mean KL after an epoch exceeds
+    ``target_kl``, remaining epochs are skipped to keep updates conservative.
     """
 
     def __init__(
@@ -388,7 +442,8 @@ class PPOAgent:
         ent_coef: float = 0.05,
         n_filters: int = 32,
         hidden: int = 128,
-        value_reg: float = 1e-4,
+        value_lr: float = 1e-3,
+        target_kl: float = 0.02,
         device: str = "cpu",
     ):
         self.gamma = gamma
@@ -397,6 +452,7 @@ class PPOAgent:
         self.epochs = epochs
         self.minibatch_size = minibatch_size
         self.ent_coef = ent_coef
+        self.target_kl = target_kl
         self.device = device
         self.epsilon = 0.0          # no ε-greedy by default for PPO
 
@@ -407,8 +463,8 @@ class PPOAgent:
         ).to(device)
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
 
-        # ── Linear value estimator (least squares) ───────────
-        self.value = LinearValueEstimator(obs_dim, reg=value_reg)
+        # ── MLP value estimator (gradient-based) ─────────────
+        self.value = MLPValueEstimator(obs_dim, lr=value_lr, device=device)
 
     # ── action selection ──────────────────────────────────────
 
@@ -477,11 +533,6 @@ class PPOAgent:
         advantages = advantages.to(self.device)
         returns    = returns.to(self.device)
 
-        # ── Fit value estimator by least squares ──────────────
-        obs_np     = obs_t.cpu().numpy()
-        returns_np = returns.cpu().numpy()
-        self.value.fit(obs_np, returns_np)
-
         # ── Advantage stats (before normalisation) ────────────
         adv_mean = advantages.mean().item()
         adv_std  = advantages.std().item()
@@ -491,10 +542,11 @@ class PPOAgent:
         # ── Normalise advantages ──────────────────────────────
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # ── PPO policy update (multiple epochs) ───────────────
+        # ── PPO policy + value update (multiple epochs) ──────
         N = len(obs_t)
         indices = np.arange(N)
         total_pg_loss = 0.0
+        total_vf_loss = 0.0
         total_entropy = 0.0
         total_grad_norm = 0.0
         total_ratio_sum = 0.0
@@ -503,8 +555,12 @@ class PPOAgent:
         total_samples = 0
         total_kl = 0.0
         n_updates = 0
+        epochs_completed = 0
 
-        for _ in range(self.epochs):
+        for _epoch in range(self.epochs):
+            epoch_kl = 0.0
+            epoch_batches = 0
+
             np.random.shuffle(indices)
             for start in range(0, N, self.minibatch_size):
                 end = start + self.minibatch_size
@@ -537,33 +593,40 @@ class PPOAgent:
                 gn = nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
                 self.optimizer.step()
 
+                # Value update (separate optimizer, separate backward)
+                vf_loss = self.value.train_on_batch(obs_t[mb], returns[mb])
+
                 # Accumulate diagnostics
+                approx_kl_mb = (old_lp_t[mb] - new_lp).mean().item()
                 total_pg_loss += pg_loss.item()
+                total_vf_loss += vf_loss
                 total_entropy += entropy.item()
                 total_grad_norm += gn.item()
                 total_ratio_sum += ratio.mean().item()
                 max_ratio = max(max_ratio, ratio.max().item())
                 total_clipped += ((ratio - 1.0).abs() > self.clip_eps).sum().item()
                 total_samples += len(mb)
-                total_kl += (old_lp_t[mb] - new_lp).mean().item()
+                total_kl += approx_kl_mb
+                epoch_kl += approx_kl_mb
+                epoch_batches += 1
                 n_updates += 1
 
-        # ── Value loss for logging (post-fit residual MSE) ────
-        with torch.no_grad():
-            fitted_vals = torch.as_tensor(
-                self.value.predict(obs_np),
-                dtype=torch.float32, device=self.device,
-            )
-            vf_loss = F.mse_loss(fitted_vals, returns).item()
+            epochs_completed += 1
+
+            # Target-KL early stopping
+            if self.target_kl and epoch_kl / max(epoch_batches, 1) > self.target_kl:
+                break
 
         # ── Explained variance ────────────────────────────────
+        obs_np = obs_t.cpu().numpy()
+        returns_np = returns.cpu().numpy()
         fitted_vals_np = self.value.predict(obs_np)
         var_true = np.var(returns_np)
         explained_var = 1.0 - np.var(returns_np - fitted_vals_np) / max(var_true, 1e-8)
 
         return {
             "policy_loss": total_pg_loss / max(n_updates, 1),
-            "value_loss":  vf_loss,
+            "value_loss":  total_vf_loss / max(n_updates, 1),
             "entropy":     total_entropy / max(n_updates, 1),
             "mean_return": returns.mean().item(),
             "grad_norm":   total_grad_norm / max(n_updates, 1),
@@ -576,4 +639,5 @@ class PPOAgent:
             "clip_fraction":  total_clipped / max(total_samples, 1),
             "explained_variance": explained_var,
             "approx_kl":      total_kl / max(n_updates, 1),
+            "epochs_completed": epochs_completed,
         }
