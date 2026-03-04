@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""
-train.py — Train REINFORCE and PPO agents on Tetris-Lite
-=========================================================
-Produces checkpoints, metrics (JSON), learning curves, diagnostic
-plots, gameplay GIFs, and evaluation boxplots.
-
-Usage:
-    python train.py
-"""
 
 import argparse
 import json
 import time
 import numpy as np
 import torch
-import torch.nn as nn
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -30,37 +20,24 @@ from lib.visualize import (
 )
 
 
-# ══════════════════════════════════════════════════════════════
-# Configuration
-# ══════════════════════════════════════════════════════════════
-
 def get_device() -> str:
     if torch.cuda.is_available():
         return "cuda"
-    # MPS is slower than CPU for this model size (per-step sync overhead
-    # dominates the small batched-update speedup), so we skip it.
     return "cpu"
 
 DEVICE = get_device()
 
-# Board
 BOARD_W   = 6
 BOARD_H   = 20
 MAX_STEPS = 500
 HIDDEN    = 256
 
-# Output directories
 GIF_DIR  = Path("gifs");        GIF_DIR.mkdir(exist_ok=True)
 CKPT_DIR = Path("checkpoints"); CKPT_DIR.mkdir(exist_ok=True)
 LOG_DIR  = Path("logs");        LOG_DIR.mkdir(exist_ok=True)
 
 
-# ══════════════════════════════════════════════════════════════
-# Helpers
-# ══════════════════════════════════════════════════════════════
-
 def smooth(values, window=20):
-    """Simple moving average."""
     arr = np.array(values, dtype=np.float64)
     if len(arr) < window:
         return arr.tolist()
@@ -79,7 +56,6 @@ def compute_board_stats(env: TetrisLiteEnv) -> dict:
 
 
 def fixed_seed_eval(agent, seeds=EVAL_SEEDS, max_steps=500):
-    """Evaluate agent on fixed seeds for comparable progress tracking."""
     results = []
     for s in seeds:
         env = TetrisLiteEnv(width=BOARD_W, height=BOARD_H, max_steps=max_steps, seed=s)
@@ -98,7 +74,6 @@ def fixed_seed_eval(agent, seeds=EVAL_SEEDS, max_steps=500):
 
 
 def sanitize_for_json(obj):
-    """Make numpy / nan values JSON-serialisable."""
     if isinstance(obj, dict):
         return {k: sanitize_for_json(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -114,10 +89,6 @@ def sanitize_for_json(obj):
     return obj
 
 
-# ══════════════════════════════════════════════════════════════
-# REINFORCE Training
-# ══════════════════════════════════════════════════════════════
-
 def train_reinforce():
     N_EPISODES = 2000
     LR         = 5e-4
@@ -125,6 +96,7 @@ def train_reinforce():
     ENT_START, ENT_END = 0.05, 0.002
     EPS_START, EPS_END = 0.10, 0.00
     SNAPSHOT_EVERY = 250
+    FIXED_EVAL_EVERY = 250
 
     env = TetrisLiteEnv(width=BOARD_W, height=BOARD_H, max_steps=MAX_STEPS)
     agent = ReinforceAgent(
@@ -133,22 +105,17 @@ def train_reinforce():
         ent_coef=ENT_START, epsilon=EPS_START, device=DEVICE,
     )
 
-    FIXED_EVAL_EVERY = 250
-
     metrics = {
         "rewards": [], "lines": [], "steps_survived": [],
         "entropy": [], "policy_loss": [], "gradient_norm": [],
         "per_piece_rewards": {n: [] for n in PIECE_NAMES},
         "board_holes": [], "board_bumpiness": [], "board_max_height": [],
-        # reward decomposition (per-step mean)
         "reward_line_clear": [], "reward_survival": [],
         "reward_hole_penalty": [], "reward_hole_removal": [],
         "reward_bump_penalty": [], "reward_height_penalty": [],
-        # new diagnostics
         "singles": [], "doubles": [], "triples": [], "quads": [],
-        "topout": [],  # 1 if episode ended in top-out, 0 otherwise
+        "topout": [],
         "n_placeable_mean": [],
-        # fixed-seed eval
         "fixed_eval_episodes": [],
         "fixed_eval_mean_reward": [],
         "fixed_eval_mean_lines": [],
@@ -168,12 +135,10 @@ def train_reinforce():
         ep_lines = 0
         ep_steps = 0
         piece_rewards = {n: [] for n in PIECE_NAMES}
-        # reward components accumulator
         rc = {k: 0.0 for k in [
             "line_clear", "survival", "hole_penalty",
             "hole_removal", "bump_penalty", "height_penalty",
         ]}
-        # line-clear composition
         clear_counts = {1: 0, 2: 0, 3: 0, 4: 0}
         placeable_counts = []
 
@@ -188,11 +153,9 @@ def train_reinforce():
             ep_lines += info["lines"]
             ep_steps += 1
             piece_rewards[piece_name].append(reward)
-            # accumulate reward components
             for k, v in env.last_reward_info.items():
                 if k in rc:
                     rc[k] += v
-            # track clear type
             ct = env.last_reward_info.get("clear_type", 0)
             if ct in clear_counts:
                 clear_counts[ct] += 1
@@ -200,14 +163,12 @@ def train_reinforce():
 
         board_stats = compute_board_stats(env)
         stats = agent.update(buf)
-        topped_out = env.board[0].any()  # top row occupied = topped out
+        topped_out = env.board[0].any()
 
-        # Normalize reward components to per-step mean
         if ep_steps > 0:
             for k in rc:
                 rc[k] /= ep_steps
 
-        # Store metrics
         metrics["rewards"].append(ep_reward)
         metrics["lines"].append(ep_lines)
         metrics["steps_survived"].append(ep_steps)
@@ -237,7 +198,6 @@ def train_reinforce():
         if ep % SNAPSHOT_EVERY == 0 or ep == 1:
             snapshots.append((ep, env.render_board().copy(), ep_reward, ep_lines))
 
-        # Fixed-seed evaluation
         if ep % FIXED_EVAL_EVERY == 0 or ep == 1:
             eval_res = fixed_seed_eval(agent)
             metrics["fixed_eval_episodes"].append(ep)
@@ -257,10 +217,6 @@ def train_reinforce():
     return agent, metrics, snapshots, hyperparams
 
 
-# ══════════════════════════════════════════════════════════════
-# PPO Training
-# ══════════════════════════════════════════════════════════════
-
 def train_ppo(policy_type="cnn", value_type="mlp"):
     N_ITERS       = 300
     ROLLOUT_STEPS = 4096
@@ -275,6 +231,7 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
     TARGET_KL     = 0.02
     ENT_START, ENT_END = 0.20, 0.02
     SNAPSHOT_EVERY = 50
+    FIXED_EVAL_EVERY = 50
 
     env = TetrisLiteEnv(width=BOARD_W, height=BOARD_H, max_steps=MAX_STEPS)
     agent = PPOAgent(
@@ -287,12 +244,8 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
         policy_type=policy_type, value_type=value_type,
     )
 
-    FIXED_EVAL_EVERY = 50
-
     metrics = {
-        # Per-episode (flat lists across all iterations)
         "ep_rewards": [], "ep_lines": [], "ep_steps": [],
-        # Per-iteration aggregates
         "iter_mean_reward": [], "iter_mean_lines": [],
         "policy_loss": [], "value_loss": [], "entropy": [], "gradient_norm": [],
         "advantage_mean": [], "advantage_std": [], "advantage_min": [], "advantage_max": [],
@@ -301,19 +254,15 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
         "ep_length_mean": [], "ep_length_std": [],
         "board_holes_mean": [], "board_bumpiness_mean": [], "board_max_height_mean": [],
         "per_piece_rewards": {n: [] for n in PIECE_NAMES},
-        # Reward decomposition (per-step mean, averaged across completed episodes)
         "reward_line_clear": [], "reward_survival": [],
         "reward_hole_penalty": [], "reward_hole_removal": [],
         "reward_bump_penalty": [], "reward_height_penalty": [],
-        # Value calibration samples (stored periodically)
         "value_calibration_iters": [],
         "value_calibration_pred": [],
         "value_calibration_actual": [],
-        # New diagnostics
         "singles": [], "doubles": [], "triples": [], "quads": [],
-        "topout_rate": [],  # fraction of episodes that topped out this iteration
+        "topout_rate": [],
         "n_placeable_mean": [],
-        # Fixed-seed eval
         "fixed_eval_iters": [],
         "fixed_eval_mean_reward": [],
         "fixed_eval_mean_lines": [],
@@ -332,7 +281,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
         ep_steps_iter = []
         piece_rewards = {n: [] for n in PIECE_NAMES}
         board_stats_list = []
-        # Per-episode reward components
         ep_reward_components = []
         cur_rc = {k: 0.0 for k in [
             "line_clear", "survival", "hole_penalty",
@@ -340,7 +288,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
         ]}
         cur_rew, cur_lines, cur_steps = 0.0, 0, 0
         done = False
-        # New per-iteration accumulators
         iter_clear_counts = {1: 0, 2: 0, 3: 0, 4: 0}
         iter_placeable = []
         iter_topouts = 0
@@ -366,7 +313,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
             for k, v in env.last_reward_info.items():
                 if k in cur_rc:
                     cur_rc[k] += v
-            # track clear type
             ct = env.last_reward_info.get("clear_type", 0)
             if ct in iter_clear_counts:
                 iter_clear_counts[ct] += 1
@@ -376,7 +322,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
                 ep_rewards_iter.append(cur_rew)
                 ep_lines_iter.append(cur_lines)
                 ep_steps_iter.append(cur_steps)
-                # Normalize reward components to per-step mean
                 if cur_steps > 0:
                     normalized_rc = {k: v / cur_steps for k, v in cur_rc.items()}
                 else:
@@ -389,7 +334,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
                 cur_rc = {k: 0.0 for k in cur_rc}
                 obs = env.reset()
 
-        # Bootstrap
         last_val = 0.0
         if not done:
             mask = env.legal_action_mask()
@@ -398,7 +342,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
 
         stats = agent.update(buf, last_value=last_val)
 
-        # Store per-episode metrics
         metrics["ep_rewards"].extend(ep_rewards_iter)
         metrics["ep_lines"].extend(ep_lines_iter)
         metrics["ep_steps"].extend(ep_steps_iter)
@@ -408,7 +351,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
         metrics["iter_mean_reward"].append(float(mean_rew))
         metrics["iter_mean_lines"].append(float(mean_lines))
 
-        # PPO diagnostics
         for key in ["policy_loss", "value_loss", "entropy", "gradient_norm",
                      "advantage_mean", "advantage_std", "advantage_min", "advantage_max",
                      "ratio_mean", "ratio_max", "clip_fraction", "explained_variance",
@@ -416,12 +358,10 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
             k_stats = "grad_norm" if key == "gradient_norm" else key
             metrics[key].append(stats.get(k_stats, 0.0))
 
-        # Per-piece rewards
         for name in PIECE_NAMES:
             v = np.mean(piece_rewards[name]) if piece_rewards[name] else float("nan")
             metrics["per_piece_rewards"][name].append(v)
 
-        # Episode length
         if ep_steps_iter:
             metrics["ep_length_mean"].append(float(np.mean(ep_steps_iter)))
             metrics["ep_length_std"].append(float(np.std(ep_steps_iter)))
@@ -429,7 +369,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
             metrics["ep_length_mean"].append(0.0)
             metrics["ep_length_std"].append(0.0)
 
-        # Board stats
         if board_stats_list:
             metrics["board_holes_mean"].append(float(np.mean([s["holes"] for s in board_stats_list])))
             metrics["board_bumpiness_mean"].append(float(np.mean([s["bumpiness"] for s in board_stats_list])))
@@ -439,7 +378,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
             metrics["board_bumpiness_mean"].append(0.0)
             metrics["board_max_height_mean"].append(0.0)
 
-        # Reward decomposition (average across completed episodes this iteration)
         if ep_reward_components:
             for key in ["line_clear", "survival", "hole_penalty",
                         "hole_removal", "bump_penalty", "height_penalty"]:
@@ -451,7 +389,6 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
                         "hole_removal", "bump_penalty", "height_penalty"]:
                 metrics[f"reward_{key}"].append(0.0)
 
-        # New diagnostics
         metrics["singles"].append(iter_clear_counts[1])
         metrics["doubles"].append(iter_clear_counts[2])
         metrics["triples"].append(iter_clear_counts[3])
@@ -459,15 +396,12 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
         metrics["topout_rate"].append(iter_topouts / max(iter_n_episodes, 1))
         metrics["n_placeable_mean"].append(float(np.mean(iter_placeable)) if iter_placeable else 0.0)
 
-        # Value calibration samples (every 50 iterations)
         if it % 50 == 0 or it == 1:
             obs_np = np.array(buf.obs)
-            returns_np = stats.get("mean_return", 0.0)  # use actual returns
-            # Predict values for a subsample
+            returns_np = stats.get("mean_return", 0.0)
             n_sample = min(200, len(obs_np))
             idx = np.random.choice(len(obs_np), n_sample, replace=False)
             pred = agent.value.predict(obs_np[idx])
-            # Compute actual returns for these indices
             _, _, rew_t, done_t, _, val_t, _ = buf.to_tensors("cpu")
             from lib.agents import compute_gae
             _, rets = compute_gae(rew_t, val_t, done_t, agent.gamma, agent.lam, last_value=last_val)
@@ -476,14 +410,12 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
             metrics["value_calibration_pred"].append(pred.tolist())
             metrics["value_calibration_actual"].append(actual.tolist())
 
-        # Fixed-seed evaluation
         if it % FIXED_EVAL_EVERY == 0 or it == 1:
             eval_res = fixed_seed_eval(agent)
             metrics["fixed_eval_iters"].append(it)
             metrics["fixed_eval_mean_reward"].append(float(np.mean([r["reward"] for r in eval_res])))
             metrics["fixed_eval_mean_lines"].append(float(np.mean([r["lines"] for r in eval_res])))
 
-        # Snapshots
         if it % SNAPSHOT_EVERY == 0 or it == 1:
             snapshots.append((it, env.render_board().copy(), float(mean_rew), int(mean_lines)))
 
@@ -502,15 +434,10 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
     return agent, metrics, snapshots, hyperparams
 
 
-# ══════════════════════════════════════════════════════════════
-# Visualization
-# ══════════════════════════════════════════════════════════════
-
 def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
                             ppo_agent, ppo_metrics, ppo_snapshots):
     print("\n=== Generating visualizations ===\n")
 
-    # ── 1. Learning curves: reward ────────────────────────────
     min_len = min(len(rf_metrics["rewards"]), len(ppo_metrics["ep_rewards"]))
     plot_learning_curves(
         {"REINFORCE": rf_metrics["rewards"][:min_len],
@@ -521,7 +448,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     )
     plt.close("all")
 
-    # ── 2. Learning curves: lines ─────────────────────────────
     plot_learning_curves(
         {"REINFORCE": rf_metrics["lines"][:min_len],
          "PPO": ppo_metrics["ep_lines"][:min_len]},
@@ -531,7 +457,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     )
     plt.close("all")
 
-    # ── 3. Steps survived comparison ──────────────────────────
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(smooth(rf_metrics["steps_survived"], 30),
             label="REINFORCE", color="#e74c3c", linewidth=2)
@@ -544,7 +469,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     plt.close(fig)
     print(f"Saved plot → {GIF_DIR / 'steps_survived_comparison.png'}")
 
-    # ── 4. PPO diagnostics panel (4-panel) ────────────────────
     fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     axes[0, 0].plot(ppo_metrics["policy_loss"], alpha=0.7, color="steelblue")
     axes[0, 0].set_title("Policy Loss"); axes[0, 0].grid(True, alpha=0.3)
@@ -559,10 +483,8 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     plt.close(fig)
     print(f"Saved plot → {GIF_DIR / 'ppo_diagnostics_panel.png'}")
 
-    # ── 5. PPO extended diagnostics (6-panel) ─────────────────
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
-    # Advantage stats
     am = ppo_metrics["advantage_mean"]
     astd = ppo_metrics["advantage_std"]
     x_range = range(len(am))
@@ -573,25 +495,20 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     axes[0, 0].plot(am, color="steelblue")
     axes[0, 0].set_title("Advantage (mean +/- std)"); axes[0, 0].grid(True, alpha=0.3)
 
-    # Ratio stats
     axes[0, 1].plot(ppo_metrics["ratio_mean"], label="mean", color="teal")
     axes[0, 1].plot(ppo_metrics["ratio_max"], label="max", color="red", alpha=0.6)
     axes[0, 1].legend(); axes[0, 1].set_title("PPO Ratio"); axes[0, 1].grid(True, alpha=0.3)
 
-    # Gradient norm
     axes[0, 2].plot(ppo_metrics["gradient_norm"], alpha=0.7, color="purple")
     axes[0, 2].set_title("Gradient Norm"); axes[0, 2].grid(True, alpha=0.3)
 
-    # Explained variance
     axes[1, 0].plot(ppo_metrics["explained_variance"], alpha=0.7, color="darkgreen")
     axes[1, 0].axhline(y=1.0, color="gray", linestyle="--", alpha=0.5)
     axes[1, 0].set_title("Explained Variance"); axes[1, 0].grid(True, alpha=0.3)
 
-    # Episode length
     axes[1, 1].plot(ppo_metrics["ep_length_mean"], alpha=0.7, color="navy")
     axes[1, 1].set_title("Mean Episode Length"); axes[1, 1].grid(True, alpha=0.3)
 
-    # Board end-state stats
     axes[1, 2].plot(ppo_metrics["board_holes_mean"], label="holes", alpha=0.7)
     axes[1, 2].plot(ppo_metrics["board_bumpiness_mean"], label="bumpiness", alpha=0.7)
     axes[1, 2].plot(ppo_metrics["board_max_height_mean"], label="max height", alpha=0.7)
@@ -602,7 +519,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     plt.close(fig)
     print(f"Saved plot → {GIF_DIR / 'ppo_extended_diagnostics.png'}")
 
-    # ── 6. Per-piece-type reward ──────────────────────────────
     fig, ax = plt.subplots(figsize=(12, 5))
     for name in PIECE_NAMES:
         vals = ppo_metrics["per_piece_rewards"][name]
@@ -615,7 +531,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     plt.close(fig)
     print(f"Saved plot → {GIF_DIR / 'ppo_per_piece_rewards.png'}")
 
-    # ── 7. PPO reward decomposition ───────────────────────────
     fig, ax = plt.subplots(figsize=(12, 5))
     iters = range(len(ppo_metrics["reward_line_clear"]))
     components = [
@@ -635,7 +550,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     plt.close(fig)
     print(f"Saved plot → {GIF_DIR / 'ppo_reward_decomposition.png'}")
 
-    # ── 8. REINFORCE reward decomposition ─────────────────────
     fig, ax = plt.subplots(figsize=(12, 5))
     rf_components = [
         ("Line clear",    rf_metrics["reward_line_clear"],    "#2ecc71"),
@@ -654,7 +568,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     plt.close(fig)
     print(f"Saved plot → {GIF_DIR / 'reinforce_reward_decomposition.png'}")
 
-    # ── 9. REINFORCE diagnostics panel ────────────────────────
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     axes[0].plot(smooth(rf_metrics["entropy"], 30), color="mediumseagreen")
     axes[0].set_title("Entropy"); axes[0].grid(True, alpha=0.3)
@@ -667,7 +580,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     plt.close(fig)
     print(f"Saved plot → {GIF_DIR / 'reinforce_diagnostics.png'}")
 
-    # ── 10. PPO value calibration scatter ─────────────────────
     cal_iters = ppo_metrics.get("value_calibration_iters", [])
     if cal_iters:
         n_cal = len(cal_iters)
@@ -686,7 +598,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
             ax.set_title(f"Iter {it_num}")
             ax.set_xlabel("Actual Return"); ax.set_ylabel("Predicted V(s)")
             ax.grid(True, alpha=0.3)
-        # Hide unused axes
         for idx in range(n_cal, rows * cols):
             axes[idx // cols][idx % cols].set_visible(False)
         fig.suptitle("PPO: Value Calibration (V(s) vs actual return)", fontsize=14)
@@ -695,7 +606,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
         plt.close(fig)
         print(f"Saved plot → {GIF_DIR / 'ppo_value_calibration.png'}")
 
-    # ── 11. PPO KL + Clip fraction ───────────────────────────
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     ax1.plot(ppo_metrics.get("approx_kl", []), alpha=0.7, color="teal")
     ax1.set_title("Approximate KL Divergence"); ax1.set_xlabel("Iteration")
@@ -708,7 +618,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     plt.close(fig)
     print(f"Saved plot → {GIF_DIR / 'ppo_kl_and_clip.png'}")
 
-    # ── 12. PPO line-clear composition (stacked area) ──────
     singles = ppo_metrics.get("singles", [])
     if singles:
         fig, ax = plt.subplots(figsize=(12, 5))
@@ -727,7 +636,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
         plt.close(fig)
         print(f"Saved plot → {GIF_DIR / 'ppo_line_composition.png'}")
 
-    # ── 13. PPO action interface (placeable actions) ───────
     n_place = ppo_metrics.get("n_placeable_mean", [])
     if n_place:
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -739,7 +647,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
         plt.close(fig)
         print(f"Saved plot → {GIF_DIR / 'ppo_action_interface.png'}")
 
-    # ── 14. PPO top-out rate ───────────────────────────────
     topout = ppo_metrics.get("topout_rate", [])
     if topout:
         fig, ax = plt.subplots(figsize=(10, 5))
@@ -752,8 +659,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
         plt.close(fig)
         print(f"Saved plot → {GIF_DIR / 'ppo_topout_rate.png'}")
 
-    # ── 15. Fixed-seed evaluation curves ───────────────────
-    # PPO
     ppo_fe_iters = ppo_metrics.get("fixed_eval_iters", [])
     if ppo_fe_iters:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
@@ -770,7 +675,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
         plt.close(fig)
         print(f"Saved plot → {GIF_DIR / 'ppo_fixed_eval.png'}")
 
-    # REINFORCE
     rf_fe_eps = rf_metrics.get("fixed_eval_episodes", [])
     if rf_fe_eps:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
@@ -787,13 +691,11 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
         plt.close(fig)
         print(f"Saved plot → {GIF_DIR / 'reinforce_fixed_eval.png'}")
 
-    # ── 16. Training snapshots GIFs ───────────────────────────
     if rf_snapshots:
         training_snapshots_gif(rf_snapshots, str(GIF_DIR / "reinforce_training_snapshots.gif"), fps=1)
     if ppo_snapshots:
         training_snapshots_gif(ppo_snapshots, str(GIF_DIR / "ppo_training_snapshots.gif"), fps=1)
 
-    # ── 12. Gameplay GIFs (annotated) ─────────────────────────
     env_rf = TetrisLiteEnv(width=BOARD_W, height=BOARD_H, max_steps=MAX_STEPS, seed=99)
     frames_rf = play_episode_annotated(env_rf, rf_agent, max_frames=200, device=DEVICE)
     save_gif(frames_rf, str(GIF_DIR / "reinforce_gameplay.gif"), fps=6)
@@ -802,7 +704,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     frames_ppo = play_episode_annotated(env_ppo, ppo_agent, max_frames=200, device=DEVICE)
     save_gif(frames_ppo, str(GIF_DIR / "ppo_gameplay.gif"), fps=6)
 
-    # ── 13. Side-by-side comparison ───────────────────────────
     EVAL_SEED = 2024
     env1 = TetrisLiteEnv(width=BOARD_W, height=BOARD_H, max_steps=200, seed=EVAL_SEED)
     frames_rf_sbs, _, _ = play_episode(env1, rf_agent, max_frames=200, device=DEVICE)
@@ -812,7 +713,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
                      "REINFORCE", "PPO",
                      str(GIF_DIR / "reinforce_vs_ppo.gif"), fps=6)
 
-    # ── 14. Evaluation boxplots (50-episode) ──────────────────
     N_EVAL = 50
     eval_results = {"Random": [], "REINFORCE": [], "PPO": []}
     eval_lines = {"Random": [], "REINFORCE": [], "PPO": []}
@@ -854,7 +754,6 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     plt.close(fig)
     print(f"Saved plot → {GIF_DIR / 'evaluation_boxplot.png'}")
 
-    # ── 15. Animated learning curve GIF ───────────────────────
     learning_curve_gif(
         {"REINFORCE": rf_metrics["rewards"][:min_len],
          "PPO": ppo_metrics["ep_rewards"][:min_len]},
@@ -863,15 +762,10 @@ def generate_visualizations(rf_agent, rf_metrics, rf_snapshots,
     )
 
 
-# ══════════════════════════════════════════════════════════════
-# Save checkpoints & metrics
-# ══════════════════════════════════════════════════════════════
-
 def save_checkpoints(rf_agent, rf_metrics, rf_hyperparams,
                      ppo_agent, ppo_metrics, ppo_hyperparams):
     env_config = {"board_w": BOARD_W, "board_h": BOARD_H, "max_steps": MAX_STEPS}
 
-    # REINFORCE
     rf_final = {
         "mean_reward": float(np.mean(rf_metrics["rewards"][-100:])),
         "mean_lines": float(np.mean(rf_metrics["lines"][-100:])),
@@ -886,7 +780,6 @@ def save_checkpoints(rf_agent, rf_metrics, rf_hyperparams,
     }, str(CKPT_DIR / "reinforce.pt"))
     print(f"Saved checkpoint → {CKPT_DIR / 'reinforce.pt'}")
 
-    # PPO
     ppo_final = {
         "mean_reward": float(np.mean(ppo_metrics["ep_rewards"][-100:])) if ppo_metrics["ep_rewards"] else 0,
         "mean_lines": float(np.mean(ppo_metrics["ep_lines"][-100:])) if ppo_metrics["ep_lines"] else 0,
@@ -915,10 +808,6 @@ def save_metrics(rf_metrics, ppo_metrics):
         json.dump(data, f, indent=2)
     print(f"Saved metrics → {path}")
 
-
-# ══════════════════════════════════════════════════════════════
-# Main
-# ══════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(description="Tetris-Lite RL Training")

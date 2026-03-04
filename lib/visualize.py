@@ -1,13 +1,6 @@
-"""
-Visualization & GIF Utilities for Tetris-Lite RL
-=================================================
-Functions that generate frames and save animated GIFs showing
-the agent playing, learning curves overlaid on gameplay, etc.
-"""
-
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")          # headless backend for GIF generation
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.figure import Figure
@@ -16,25 +9,19 @@ from pathlib import Path
 from typing import List, Optional, Dict, Tuple
 from lib.env import TetrisLiteEnv, PIECE_NAMES
 
-# Tetromino colours (RGB float)
 PIECE_COLORS = [
-    (0.12, 0.12, 0.12),   # 0  empty
-    (0.00, 0.94, 0.94),   # 1  I  cyan
-    (0.94, 0.94, 0.00),   # 2  O  yellow
-    (0.63, 0.00, 0.94),   # 3  T  purple
-    (0.00, 0.94, 0.00),   # 4  S  green
-    (0.94, 0.00, 0.00),   # 5  Z  red
-    (0.94, 0.63, 0.00),   # 6  L  orange
-    (0.00, 0.00, 0.94),   # 7  J  blue
+    (0.12, 0.12, 0.12),
+    (0.00, 0.94, 0.94),
+    (0.94, 0.94, 0.00),
+    (0.63, 0.00, 0.94),
+    (0.00, 0.94, 0.00),
+    (0.94, 0.00, 0.00),
+    (0.94, 0.63, 0.00),
+    (0.00, 0.00, 0.94),
 ]
 
 
-# ──────────────────────────────────────────────────────────────
-# Core board-to-image
-# ──────────────────────────────────────────────────────────────
-
 def board_to_rgb(board: np.ndarray, cell: int = 20) -> np.ndarray:
-    """Convert an integer board (H,W) to an RGB uint8 image."""
     H, W = board.shape
     img = np.zeros((H * cell, W * cell, 3), dtype=np.uint8)
     for r in range(H):
@@ -46,15 +33,7 @@ def board_to_rgb(board: np.ndarray, cell: int = 20) -> np.ndarray:
     return img
 
 
-# ──────────────────────────────────────────────────────────────
-# Play one episode and collect frames
-# ──────────────────────────────────────────────────────────────
-
 def play_episode(env: TetrisLiteEnv, agent, max_frames: int = 300, device="cpu"):
-    """
-    Run the agent in the environment for one episode.
-    Returns: frames (list of RGB arrays), total_reward, total_lines
-    """
     obs = env.reset()
     frames = [board_to_rgb(env.render_board())]
     total_reward = 0.0
@@ -72,7 +51,6 @@ def play_episode(env: TetrisLiteEnv, agent, max_frames: int = 300, device="cpu")
 
 
 def play_episode_random(env: TetrisLiteEnv, max_frames: int = 300):
-    """Run a random policy."""
     obs = env.reset()
     frames = [board_to_rgb(env.render_board())]
     total_reward = 0.0
@@ -90,20 +68,11 @@ def play_episode_random(env: TetrisLiteEnv, max_frames: int = 300):
     return frames, total_reward, total_lines
 
 
-# ──────────────────────────────────────────────────────────────
-# Save GIF
-# ──────────────────────────────────────────────────────────────
-
 def save_gif(frames: List[np.ndarray], path: str, fps: int = 8):
-    """Save a list of RGB frames as an animated GIF."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     imageio.mimsave(path, frames, fps=fps, loop=0)
     print(f"Saved GIF → {path}  ({len(frames)} frames)")
 
-
-# ──────────────────────────────────────────────────────────────
-# Annotated frame (board + HUD overlay)
-# ──────────────────────────────────────────────────────────────
 
 def annotated_frame(
     board: np.ndarray,
@@ -113,7 +82,6 @@ def annotated_frame(
     piece_name: str = "",
     cell: int = 20,
 ) -> np.ndarray:
-    """Render the board with a small matplotlib HUD and return as RGB array."""
     img = board_to_rgb(board, cell)
     H_px, W_px = img.shape[:2]
 
@@ -158,7 +126,6 @@ def play_episode_annotated(
     max_frames: int = 300,
     device="cpu",
 ) -> List[np.ndarray]:
-    """Play an episode returning annotated frames (board + HUD)."""
     obs = env.reset()
     frames = []
     total_reward = 0.0
@@ -187,20 +154,12 @@ def play_episode_annotated(
     return frames
 
 
-# ──────────────────────────────────────────────────────────────
-# Learning-curve plot (static)
-# ──────────────────────────────────────────────────────────────
-
 def plot_learning_curves(
     metrics: Dict[str, List[float]],
     title: str = "Training Progress",
     window: int = 20,
     save_path: Optional[str] = None,
 ) -> Figure:
-    """
-    Plot smoothed learning curves.
-    metrics: {"label": [values_per_iteration], ...}
-    """
     fig, ax = plt.subplots(figsize=(10, 5))
     for label, vals in metrics.items():
         vals = np.array(vals, dtype=np.float64)
@@ -221,10 +180,6 @@ def plot_learning_curves(
     return fig
 
 
-# ──────────────────────────────────────────────────────────────
-# Animated learning-curve GIF
-# ──────────────────────────────────────────────────────────────
-
 def learning_curve_gif(
     all_rewards: Dict[str, List[float]],
     path: str,
@@ -232,10 +187,6 @@ def learning_curve_gif(
     step: int = 5,
     fps: int = 12,
 ):
-    """
-    Create an animated GIF of the learning curve being drawn over time.
-    all_rewards: {"REINFORCE": [...], "PPO": [...]}
-    """
     max_len = max(len(v) for v in all_rewards.values())
     frames = []
     colors = {"REINFORCE": "#e74c3c", "PPO": "#2ecc71"}
@@ -268,10 +219,6 @@ def learning_curve_gif(
     save_gif(frames, path, fps=fps)
 
 
-# ──────────────────────────────────────────────────────────────
-# Side-by-side comparison GIF
-# ──────────────────────────────────────────────────────────────
-
 def side_by_side_gif(
     frames_left: List[np.ndarray],
     frames_right: List[np.ndarray],
@@ -280,7 +227,6 @@ def side_by_side_gif(
     path: str,
     fps: int = 6,
 ):
-    """Create a side-by-side GIF comparing two agents."""
     max_len = max(len(frames_left), len(frames_right))
     combined = []
 
@@ -288,7 +234,6 @@ def side_by_side_gif(
         fl = frames_left[min(i, len(frames_left) - 1)]
         fr = frames_right[min(i, len(frames_right) - 1)]
 
-        # Resize to same height
         h = max(fl.shape[0], fr.shape[0])
         if fl.shape[0] < h:
             pad = np.zeros((h - fl.shape[0], fl.shape[1], 3), dtype=np.uint8)
@@ -297,7 +242,6 @@ def side_by_side_gif(
             pad = np.zeros((h - fr.shape[0], fr.shape[1], 3), dtype=np.uint8)
             fr = np.vstack([pad, fr])
 
-        # Add labels
         dpi = 80
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, h / dpi + 0.6), dpi=dpi)
         ax1.imshow(fl); ax1.set_title(label_left, fontsize=13, color="white")
@@ -316,20 +260,11 @@ def side_by_side_gif(
     save_gif(combined, path, fps=fps)
 
 
-# ──────────────────────────────────────────────────────────────
-# Training-snapshot GIF (board at checkpoints during training)
-# ──────────────────────────────────────────────────────────────
-
 def training_snapshots_gif(
     snapshot_boards: List[Tuple],
     path: str,
     fps: int = 2,
 ):
-    """
-    snapshot_boards: list of (iteration, board_array, reward, lines)
-    Creates a GIF cycling through board snapshots taken at different
-    stages of training.
-    """
     frames = []
     for (iteration, board, reward, lines) in snapshot_boards:
         img = board_to_rgb(board, cell=20)

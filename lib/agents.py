@@ -1,16 +1,3 @@
-"""
-Policy-Gradient Agents — REINFORCE and PPO
-===========================================
-Implemented from first principles in PyTorch.
-No stable-baselines / CleanRL / SpinningUp.
-
-Architecture (PPO):
-  • Policy  — CNN reads the raw board grid (1×H×W) + piece one-hots → logits
-  • Value   — Linear model V(s) = w^T φ(s) + b  on the compact flat features,
-              fitted by closed-form ridge regression (least squares).
-              Completely separate from the policy — no shared backbone.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,13 +6,7 @@ import numpy as np
 from typing import List, Tuple, Optional
 
 
-# ──────────────────────────────────────────────────────────────
-# MLP Policy / Value Network  (used by REINFORCE)
-# ──────────────────────────────────────────────────────────────
-
 class PolicyNetwork(nn.Module):
-    """Simple MLP policy (shared backbone, separate heads)."""
-
     def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128):
         super().__init__()
         self.shared = nn.Sequential(
@@ -43,7 +24,7 @@ class PolicyNetwork(nn.Module):
         h = self.shared(x)
         logits = self.policy_head(h)
         if mask is not None:
-            logits = logits + (1 - mask) * (-1e8)   # mask illegal actions
+            logits = logits + (1 - mask) * (-1e8)
         value = self.value_head(h).squeeze(-1)
         return logits, value
 
@@ -58,18 +39,7 @@ class PolicyNetwork(nn.Module):
         return action.item(), log_prob.item(), value.item()
 
 
-# ──────────────────────────────────────────────────────────────
-# MLP Policy Network  (logits-only, flat obs — optional PPO policy)
-# ──────────────────────────────────────────────────────────────
-
 class MLPPolicyNetwork(nn.Module):
-    """
-    MLP policy that takes flat observation → logits.
-
-    No value head — value estimation is handled by a separate estimator.
-    Same backbone depth as PolicyNetwork (3 hidden layers).
-    """
-
     def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128):
         super().__init__()
         self.net = nn.Sequential(
@@ -83,25 +53,10 @@ class MLPPolicyNetwork(nn.Module):
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """obs: (B, obs_dim) → (B, act_dim) logits."""
         return self.net(obs)
 
 
-# ──────────────────────────────────────────────────────────────
-# CNN Policy Network  (used by PPO)
-# ──────────────────────────────────────────────────────────────
-
 class CNNPolicyNetwork(nn.Module):
-    """
-    CNN policy that reads the raw board grid (1×H×W) plus a piece-info
-    vector (one-hot current + next piece).
-
-    Architecture
-    ------------
-    board (1,H,W) → Conv2d layers → flatten
-    concat with piece_info → FC → action logits
-    """
-
     def __init__(
         self,
         board_h: int,
@@ -120,13 +75,12 @@ class CNNPolicyNetwork(nn.Module):
             nn.Conv2d(n_filters * 2, n_filters * 2, kernel_size=3, padding=1),
             nn.ReLU(),
         )
-        # Compute conv output size dynamically
         with torch.no_grad():
             dummy = torch.zeros(1, 1, board_h, board_w)
             conv_out = self.conv(dummy)
             self._conv_flat = conv_out.view(1, -1).shape[1]
 
-        piece_dim = num_pieces * 2  # current + next piece one-hot
+        piece_dim = num_pieces * 2
         self.fc = nn.Sequential(
             nn.Linear(self._conv_flat + piece_dim, hidden),
             nn.ReLU(),
@@ -134,62 +88,30 @@ class CNNPolicyNetwork(nn.Module):
         )
 
     def forward(self, board: torch.Tensor, piece_info: torch.Tensor) -> torch.Tensor:
-        """
-        board      : (B, 1, H, W) float tensor
-        piece_info : (B, num_pieces*2) float tensor
-        Returns    : (B, act_dim) logits
-        """
-        x = self.conv(board)            # (B, C, h', w')
-        x = x.view(x.size(0), -1)      # (B, conv_flat)
+        x = self.conv(board)
+        x = x.view(x.size(0), -1)
         x = torch.cat([x, piece_info], dim=1)
         return self.fc(x)
 
 
-# ──────────────────────────────────────────────────────────────
-# Linear Value Estimator  (used by PPO — fitted by least squares)
-# ──────────────────────────────────────────────────────────────
-
 class LinearValueEstimator:
-    """
-    V(s) = φ(s)^T w + b
-
-    A single linear layer fitted by ridge regression (closed-form OLS).
-    Uses the compact flat observation (e.g. 35-dim) as feature vector φ(s).
-
-    No neural network, no gradient descent — just the normal equation:
-
-        w* = (X^T X + λI)^{-1} X^T y
-    """
-
     def __init__(self, obs_dim: int, reg: float = 1e-4):
         self.obs_dim = obs_dim
         self.reg = reg
-        # Weight vector including bias: [w_1, ..., w_d, b]
         self.w = np.zeros(obs_dim + 1, dtype=np.float64)
 
     def _add_bias(self, X: np.ndarray) -> np.ndarray:
-        """Append a column of ones for the bias term."""
         return np.column_stack([X, np.ones(len(X), dtype=np.float64)])
 
     def predict(self, obs: np.ndarray) -> np.ndarray:
-        """Predict values for a batch.  obs: (N, obs_dim) → (N,) float32."""
         X = self._add_bias(obs.astype(np.float64))
         return (X @ self.w).astype(np.float32)
 
     def predict_single(self, obs: np.ndarray) -> float:
-        """Predict value for one observation.  obs: (obs_dim,) → scalar."""
         x = np.append(obs.astype(np.float64), 1.0)
         return float(x @ self.w)
 
     def fit(self, obs: np.ndarray, returns: np.ndarray):
-        """
-        Fit by ridge regression (closed-form least squares).
-
-            w* = (X^T X + λI)^{-1} X^T y
-
-        obs     : (N, obs_dim)
-        returns : (N,) target values (GAE returns)
-        """
         X = self._add_bias(obs.astype(np.float64))
         y = returns.astype(np.float64)
         A = X.T @ X + self.reg * np.eye(X.shape[1])
@@ -197,22 +119,13 @@ class LinearValueEstimator:
         self.w = np.linalg.solve(A, b)
 
     def state_dict(self) -> dict:
-        """Return weights for serialisation."""
         return {"w": self.w.copy()}
 
     def load_state_dict(self, d: dict):
-        """Load weights from dict."""
         self.w = d["w"].copy()
 
 
 class MLPValueEstimator(nn.Module):
-    """
-    V(s) via a small MLP trained with Adam.
-
-    Architecture:  obs_dim → hidden1 → ReLU → hidden2 → ReLU → 1
-    Trained per-rollout alongside the policy (separate optimizer).
-    """
-
     def __init__(self, obs_dim: int, hidden1: int = 128, hidden2: int = 64,
                  lr: float = 1e-3, device: str = "cpu"):
         super().__init__()
@@ -227,18 +140,15 @@ class MLPValueEstimator(nn.Module):
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
 
     def forward(self, obs_t: torch.Tensor) -> torch.Tensor:
-        """obs_t: (N, obs_dim) → (N,)"""
         return self.net(obs_t).squeeze(-1)
 
     def predict(self, obs: np.ndarray) -> np.ndarray:
-        """Predict values for a batch. obs: (N, obs_dim) → (N,) float32."""
         with torch.no_grad():
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
             vals = self.forward(obs_t)
         return vals.cpu().numpy().astype(np.float32)
 
     def predict_single(self, obs: np.ndarray) -> float:
-        """Predict value for one observation. obs: (obs_dim,) → scalar."""
         with torch.no_grad():
             obs_t = torch.as_tensor(
                 obs, dtype=torch.float32, device=self.device
@@ -247,7 +157,6 @@ class MLPValueEstimator(nn.Module):
         return val.item()
 
     def train_on_batch(self, obs_t: torch.Tensor, returns_t: torch.Tensor) -> float:
-        """One SGD step on MSE loss. Returns loss value."""
         pred = self.forward(obs_t)
         loss = F.mse_loss(pred, returns_t)
         self.optimizer.zero_grad()
@@ -256,10 +165,6 @@ class MLPValueEstimator(nn.Module):
         self.optimizer.step()
         return loss.item()
 
-
-# ──────────────────────────────────────────────────────────────
-# Rollout Buffer
-# ──────────────────────────────────────────────────────────────
 
 class RolloutBuffer:
     def __init__(self):
@@ -270,7 +175,6 @@ class RolloutBuffer:
         self.log_probs: List[float] = []
         self.values: List[float] = []
         self.masks: List[np.ndarray] = []
-        # CNN observations (optional — used by PPO with CNN policy)
         self.board_obs: List[np.ndarray] = []
         self.piece_obs: List[np.ndarray] = []
 
@@ -303,7 +207,6 @@ class RolloutBuffer:
         )
 
     def cnn_tensors(self, device="cpu"):
-        """Return CNN observations as tensors: (board_t, piece_t)."""
         board_t = torch.tensor(
             np.array(self.board_obs), dtype=torch.float32, device=device
         )
@@ -313,10 +216,6 @@ class RolloutBuffer:
         return board_t, piece_t
 
 
-# ──────────────────────────────────────────────────────────────
-# Generalised Advantage Estimation (GAE)
-# ──────────────────────────────────────────────────────────────
-
 def compute_gae(
     rewards: torch.Tensor,
     values: torch.Tensor,
@@ -325,9 +224,7 @@ def compute_gae(
     lam: float = 0.95,
     last_value: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute GAE-Lambda advantages and discounted returns."""
     T = len(rewards)
-    # Work on CPU to avoid device mismatches; caller moves results to device
     rewards = rewards.cpu()
     values = values.cpu()
     dones = dones.cpu()
@@ -345,20 +242,7 @@ def compute_gae(
     return advantages, returns
 
 
-# ──────────────────────────────────────────────────────────────
-# REINFORCE Agent
-# ──────────────────────────────────────────────────────────────
-
 class ReinforceAgent:
-    """
-    Vanilla REINFORCE with optional baseline (mean return) and entropy regularisation.
-
-    ent_coef : weight on entropy bonus — keep high early to prevent mode collapse,
-               anneal to ~0 over training (set agent.ent_coef externally).
-    epsilon  : prob of taking a uniformly-random legal action (epsilon-greedy).
-               Anneal to 0 over training (set agent.epsilon externally).
-    """
-
     def __init__(
         self,
         obs_dim: int,
@@ -378,7 +262,6 @@ class ReinforceAgent:
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=lr)
 
     def select_action(self, obs: np.ndarray, mask: np.ndarray, env=None):
-        """Select action.  `env` is accepted for interface compatibility but ignored."""
         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
         mask_t = torch.tensor(mask, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
@@ -395,7 +278,6 @@ class ReinforceAgent:
     def update(self, buffer: RolloutBuffer) -> dict:
         obs_t, act_t, rew_t, done_t, old_lp_t, val_t, mask_t = buffer.to_tensors(self.device)
 
-        # Compute discounted returns (no GAE — plain MC returns)
         T = len(rew_t)
         returns = torch.zeros(T)
         G = 0.0
@@ -406,16 +288,13 @@ class ReinforceAgent:
             returns[t] = G
         returns = returns.to(self.device)
 
-        # Baseline = mean return (simple variance reduction)
         baseline = returns.mean()
 
-        # Forward pass
         logits, _ = self.net(obs_t, mask_t)
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(act_t)
         entropy = dist.entropy().mean()
 
-        # Policy loss: -E[log π(a|s) * (G - b)] - ent_coef * H[π]
         policy_loss = -(log_probs * (returns - baseline)).mean()
         loss = policy_loss - self.ent_coef * entropy
 
@@ -432,25 +311,7 @@ class ReinforceAgent:
         }
 
 
-# ──────────────────────────────────────────────────────────────
-# PPO Agent  (CNN policy  +  linear value estimator)
-# ──────────────────────────────────────────────────────────────
-
 class PPOAgent:
-    """
-    Proximal Policy Optimization (clip variant) with GAE.
-
-    Architecture  (configurable)
-    ----------------------------
-    • Policy  – ``"cnn"`` (default): CNN reads the raw board + piece one-hots
-                ``"mlp"``: 3-layer MLP on the flat 35-dim observation
-    • Value   – ``"mlp"`` (default): small MLP trained with Adam
-                ``"linear"``: ridge regression (closed-form)
-
-    Target-KL early stopping: if mean KL after an epoch exceeds
-    ``target_kl``, remaining epochs are skipped to keep updates conservative.
-    """
-
     def __init__(
         self,
         obs_dim: int,
@@ -481,11 +342,10 @@ class PPOAgent:
         self.ent_coef = ent_coef
         self.target_kl = target_kl
         self.device = device
-        self.epsilon = 0.0          # no ε-greedy by default for PPO
+        self.epsilon = 0.0
         self.policy_type = policy_type
         self.value_type = value_type
 
-        # ── Policy network ────────────────────────────────────
         if policy_type == "cnn":
             self.policy = CNNPolicyNetwork(
                 board_h, board_w, num_pieces, act_dim,
@@ -499,7 +359,6 @@ class PPOAgent:
             raise ValueError(f"Unknown policy_type: {policy_type!r}")
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
 
-        # ── Value estimator ───────────────────────────────────
         if value_type == "mlp":
             self.value = MLPValueEstimator(obs_dim, lr=value_lr, device=device)
         elif value_type == "linear":
@@ -511,24 +370,9 @@ class PPOAgent:
     def uses_cnn(self) -> bool:
         return self.policy_type == "cnn"
 
-    # ── action selection ──────────────────────────────────────
-
     def select_action(self, obs: np.ndarray, mask: np.ndarray, env=None):
-        """
-        Parameters
-        ----------
-        obs  : flat observation (obs_dim,) — for value estimator (and MLP policy)
-        mask : legal action mask (act_dim,)
-        env  : TetrisLiteEnv — required only for CNN policy (provides board + piece)
-
-        Returns
-        -------
-        (action: int, log_prob: float, value: float)
-        """
-        # Value prediction (always uses flat obs)
         value = self.value.predict_single(obs)
 
-        # Policy forward pass
         with torch.no_grad():
             if self.policy_type == "cnn":
                 assert env is not None, (
@@ -537,23 +381,21 @@ class PPOAgent:
                 board_2d, piece_vec = env.get_cnn_obs()
                 board_t = torch.as_tensor(
                     board_2d, dtype=torch.float32, device=self.device
-                ).unsqueeze(0)                                     # (1, 1, H, W)
+                ).unsqueeze(0)
                 piece_t = torch.as_tensor(
                     piece_vec, dtype=torch.float32, device=self.device
-                ).unsqueeze(0)                                     # (1, 14)
-                logits = self.policy(board_t, piece_t)             # (1, act_dim)
+                ).unsqueeze(0)
+                logits = self.policy(board_t, piece_t)
             else:
                 obs_t = torch.as_tensor(
                     obs, dtype=torch.float32, device=self.device
-                ).unsqueeze(0)                                     # (1, obs_dim)
-                logits = self.policy(obs_t)                        # (1, act_dim)
+                ).unsqueeze(0)
+                logits = self.policy(obs_t)
 
-        # Mask illegal actions
         mask_t = torch.as_tensor(mask, dtype=torch.float32, device=self.device)
         logits = logits[0] + (1 - mask_t) * (-1e8)
         dist = Categorical(logits=logits)
 
-        # ε-greedy (usually 0 for PPO)
         if self.epsilon > 0 and np.random.random() < self.epsilon:
             legal = np.where(mask)[0]
             action = int(np.random.choice(legal))
@@ -567,17 +409,13 @@ class PPOAgent:
 
         return action, log_prob, value
 
-    # ── PPO update ────────────────────────────────────────────
-
     def update(self, buffer: RolloutBuffer, last_value: float = 0.0) -> dict:
         obs_t, act_t, rew_t, done_t, old_lp_t, val_t, mask_t = \
             buffer.to_tensors(self.device)
 
-        # CNN tensors only needed for CNN policy
         if self.policy_type == "cnn":
             board_t, piece_t = buffer.cnn_tensors(self.device)
 
-        # ── GAE ───────────────────────────────────────────────
         advantages, returns = compute_gae(
             rew_t, val_t, done_t, self.gamma, self.lam,
             last_value=last_value,
@@ -585,20 +423,16 @@ class PPOAgent:
         advantages = advantages.to(self.device)
         returns    = returns.to(self.device)
 
-        # ── Advantage stats (before normalisation) ────────────
         adv_mean = advantages.mean().item()
         adv_std  = advantages.std().item()
         adv_min  = advantages.min().item()
         adv_max  = advantages.max().item()
 
-        # ── Normalise advantages ──────────────────────────────
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # ── Linear value: fit once (closed-form) before epochs ─
         if self.value_type == "linear":
             self.value.fit(obs_t.cpu().numpy(), returns.cpu().numpy())
 
-        # ── PPO policy + value update (multiple epochs) ──────
         N = len(obs_t)
         indices = np.arange(N)
         total_pg_loss = 0.0
@@ -622,20 +456,17 @@ class PPOAgent:
                 end = start + self.minibatch_size
                 mb = indices[start:end]
 
-                # Forward through policy
                 if self.policy_type == "cnn":
                     logits = self.policy(board_t[mb], piece_t[mb])
                 else:
                     logits = self.policy(obs_t[mb])
 
-                # Mask illegal actions
                 logits = logits + (1 - mask_t[mb]) * (-1e8)
                 dist = Categorical(logits=logits)
 
                 new_lp  = dist.log_prob(act_t[mb])
                 entropy = dist.entropy().mean()
 
-                # Clipped surrogate objective
                 ratio = torch.exp(new_lp - old_lp_t[mb])
                 mb_adv = advantages[mb]
                 surr1 = ratio * mb_adv
@@ -644,7 +475,6 @@ class PPOAgent:
                 ) * mb_adv
                 pg_loss = -torch.min(surr1, surr2).mean()
 
-                # Policy loss only — value has its own backward
                 loss = pg_loss - self.ent_coef * entropy
 
                 self.optimizer.zero_grad()
@@ -652,11 +482,9 @@ class PPOAgent:
                 gn = nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
                 self.optimizer.step()
 
-                # Value update
                 if self.value_type == "mlp":
                     vf_loss = self.value.train_on_batch(obs_t[mb], returns[mb])
                 else:
-                    # Linear: already fit above; compute residual MSE for logging
                     with torch.no_grad():
                         pred = torch.as_tensor(
                             self.value.predict(obs_t[mb].cpu().numpy()),
@@ -664,7 +492,6 @@ class PPOAgent:
                         )
                         vf_loss = ((pred - returns[mb]) ** 2).mean().item()
 
-                # Accumulate diagnostics
                 approx_kl_mb = (old_lp_t[mb] - new_lp).mean().item()
                 total_pg_loss += pg_loss.item()
                 total_vf_loss += vf_loss
@@ -681,11 +508,9 @@ class PPOAgent:
 
             epochs_completed += 1
 
-            # Target-KL early stopping
             if self.target_kl and epoch_kl / max(epoch_batches, 1) > self.target_kl:
                 break
 
-        # ── Explained variance ────────────────────────────────
         obs_np = obs_t.cpu().numpy()
         returns_np = returns.cpu().numpy()
         fitted_vals_np = self.value.predict(obs_np)

@@ -1,6 +1,3 @@
-"""
-Tetris-Lite RL — clean library modules.
-"""
 from lib.env import TetrisLiteEnv, PIECE_NAMES, NUM_PIECES, TETROMINOS
 from lib.agents import (
     CNNPolicyNetwork,
