@@ -9,6 +9,7 @@ Usage:
     python train.py
 """
 
+import argparse
 import json
 import time
 import numpy as np
@@ -260,7 +261,7 @@ def train_reinforce():
 # PPO Training
 # ══════════════════════════════════════════════════════════════
 
-def train_ppo():
+def train_ppo(policy_type="cnn", value_type="mlp"):
     N_ITERS       = 300
     ROLLOUT_STEPS = 4096
     LR            = 3e-4
@@ -283,6 +284,7 @@ def train_ppo():
         epochs=EPOCHS, minibatch_size=MINIBATCH, ent_coef=ENT_START,
         n_filters=N_FILTERS, hidden=HIDDEN, value_lr=VALUE_LR,
         target_kl=TARGET_KL, device=DEVICE,
+        policy_type=policy_type, value_type=value_type,
     )
 
     FIXED_EVAL_EVERY = 50
@@ -346,10 +348,14 @@ def train_ppo():
 
         for _ in range(ROLLOUT_STEPS):
             mask = env.legal_action_mask()
-            board_obs, piece_obs = env.get_cnn_obs()
+            if agent.uses_cnn:
+                board_obs, piece_obs = env.get_cnn_obs()
+            else:
+                board_obs, piece_obs = None, None
             piece_name = PIECE_NAMES[env.current_piece]
             iter_placeable.append(int(mask.sum()))
-            action, lp, val = agent.select_action(obs, mask, env=env)
+            action, lp, val = agent.select_action(
+                obs, mask, env=env if agent.uses_cnn else None)
             next_obs, rew, done, info = env.step(action)
             buf.store(obs, action, rew, done, lp, val, mask,
                       board_obs=board_obs, piece_obs=piece_obs)
@@ -387,7 +393,8 @@ def train_ppo():
         last_val = 0.0
         if not done:
             mask = env.legal_action_mask()
-            _, _, last_val = agent.select_action(obs, mask, env=env)
+            _, _, last_val = agent.select_action(
+                obs, mask, env=env if agent.uses_cnn else None)
 
         stats = agent.update(buf, last_value=last_val)
 
@@ -490,6 +497,7 @@ def train_ppo():
         "n_filters": N_FILTERS, "ent_start": ENT_START, "ent_end": ENT_END,
         "n_iters": N_ITERS, "rollout_steps": ROLLOUT_STEPS,
         "value_lr": VALUE_LR, "target_kl": TARGET_KL,
+        "policy_type": policy_type, "value_type": value_type,
     }
     return agent, metrics, snapshots, hyperparams
 
@@ -886,6 +894,8 @@ def save_checkpoints(rf_agent, rf_metrics, rf_hyperparams,
     torch.save({
         "policy": ppo_agent.policy.state_dict(),
         "value": ppo_agent.value.state_dict(),
+        "policy_type": ppo_agent.policy_type,
+        "value_type": ppo_agent.value_type,
         "hyperparams": ppo_hyperparams,
         "reward_weights": dict(REWARD_WEIGHTS),
         "env_config": env_config,
@@ -911,10 +921,18 @@ def save_metrics(rf_metrics, ppo_metrics):
 # ══════════════════════════════════════════════════════════════
 
 def main():
+    parser = argparse.ArgumentParser(description="Tetris-Lite RL Training")
+    parser.add_argument("--policy", choices=["cnn", "mlp"], default="cnn",
+                        help="PPO policy network type (default: cnn)")
+    parser.add_argument("--value", choices=["mlp", "linear"], default="mlp",
+                        help="PPO value estimator type (default: mlp)")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("Tetris-Lite RL Training")
     print(f"Board: {BOARD_H}x{BOARD_W}, max_steps={MAX_STEPS}")
     print(f"Device: {DEVICE}")
+    print(f"PPO config: policy={args.policy}, value={args.value}")
     print("=" * 60)
 
     t0 = time.time()
@@ -923,7 +941,9 @@ def main():
     rf_agent, rf_metrics, rf_snapshots, rf_hp = train_reinforce()
 
     print("\n>>> Training PPO <<<")
-    ppo_agent, ppo_metrics, ppo_snapshots, ppo_hp = train_ppo()
+    ppo_agent, ppo_metrics, ppo_snapshots, ppo_hp = train_ppo(
+        policy_type=args.policy, value_type=args.value,
+    )
 
     save_checkpoints(rf_agent, rf_metrics, rf_hp,
                      ppo_agent, ppo_metrics, ppo_hp)

@@ -59,6 +59,35 @@ class PolicyNetwork(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────
+# MLP Policy Network  (logits-only, flat obs — optional PPO policy)
+# ──────────────────────────────────────────────────────────────
+
+class MLPPolicyNetwork(nn.Module):
+    """
+    MLP policy that takes flat observation → logits.
+
+    No value head — value estimation is handled by a separate estimator.
+    Same backbone depth as PolicyNetwork (3 hidden layers).
+    """
+
+    def __init__(self, obs_dim: int, act_dim: int, hidden: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, act_dim),
+        )
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        """obs: (B, obs_dim) → (B, act_dim) logits."""
+        return self.net(obs)
+
+
+# ──────────────────────────────────────────────────────────────
 # CNN Policy Network  (used by PPO)
 # ──────────────────────────────────────────────────────────────
 
@@ -411,16 +440,12 @@ class PPOAgent:
     """
     Proximal Policy Optimization (clip variant) with GAE.
 
-    Architecture
-    ------------
-    • Policy  – CNN reads the raw board (1×H×W) + piece one-hots → logits
-    • Value   – MLP V(s) on the 35-dim flat features, trained with Adam
-                (separate optimizer, separate backward pass).
-
-    Separating policy and value this way:
-      1. Eliminates the gradient conflict in a shared backbone
-      2. Gives the policy a spatial (CNN) inductive bias for the grid
-      3. Lets the value function learn nonlinear patterns independently
+    Architecture  (configurable)
+    ----------------------------
+    • Policy  – ``"cnn"`` (default): CNN reads the raw board + piece one-hots
+                ``"mlp"``: 3-layer MLP on the flat 35-dim observation
+    • Value   – ``"mlp"`` (default): small MLP trained with Adam
+                ``"linear"``: ridge regression (closed-form)
 
     Target-KL early stopping: if mean KL after an epoch exceeds
     ``target_kl``, remaining epochs are skipped to keep updates conservative.
@@ -445,6 +470,8 @@ class PPOAgent:
         value_lr: float = 1e-3,
         target_kl: float = 0.02,
         device: str = "cpu",
+        policy_type: str = "cnn",
+        value_type: str = "mlp",
     ):
         self.gamma = gamma
         self.lam = lam
@@ -455,16 +482,34 @@ class PPOAgent:
         self.target_kl = target_kl
         self.device = device
         self.epsilon = 0.0          # no ε-greedy by default for PPO
+        self.policy_type = policy_type
+        self.value_type = value_type
 
-        # ── CNN policy ────────────────────────────────────────
-        self.policy = CNNPolicyNetwork(
-            board_h, board_w, num_pieces, act_dim,
-            n_filters=n_filters, hidden=hidden,
-        ).to(device)
+        # ── Policy network ────────────────────────────────────
+        if policy_type == "cnn":
+            self.policy = CNNPolicyNetwork(
+                board_h, board_w, num_pieces, act_dim,
+                n_filters=n_filters, hidden=hidden,
+            ).to(device)
+        elif policy_type == "mlp":
+            self.policy = MLPPolicyNetwork(
+                obs_dim, act_dim, hidden=hidden,
+            ).to(device)
+        else:
+            raise ValueError(f"Unknown policy_type: {policy_type!r}")
         self.optimizer = torch.optim.Adam(self.policy.parameters(), lr=lr)
 
-        # ── MLP value estimator (gradient-based) ─────────────
-        self.value = MLPValueEstimator(obs_dim, lr=value_lr, device=device)
+        # ── Value estimator ───────────────────────────────────
+        if value_type == "mlp":
+            self.value = MLPValueEstimator(obs_dim, lr=value_lr, device=device)
+        elif value_type == "linear":
+            self.value = LinearValueEstimator(obs_dim)
+        else:
+            raise ValueError(f"Unknown value_type: {value_type!r}")
+
+    @property
+    def uses_cnn(self) -> bool:
+        return self.policy_type == "cnn"
 
     # ── action selection ──────────────────────────────────────
 
@@ -472,32 +517,36 @@ class PPOAgent:
         """
         Parameters
         ----------
-        obs  : flat observation (obs_dim,) — for the linear value estimator
+        obs  : flat observation (obs_dim,) — for value estimator (and MLP policy)
         mask : legal action mask (act_dim,)
-        env  : TetrisLiteEnv — REQUIRED for the CNN policy (provides board + piece)
+        env  : TetrisLiteEnv — required only for CNN policy (provides board + piece)
 
         Returns
         -------
         (action: int, log_prob: float, value: float)
         """
-        assert env is not None, (
-            "PPOAgent.select_action requires env for CNN observation"
-        )
-
-        # Value from linear estimator (pure numpy, no gradient)
+        # Value prediction (always uses flat obs)
         value = self.value.predict_single(obs)
 
-        # CNN policy (torch, no_grad for inference)
-        board_2d, piece_vec = env.get_cnn_obs()
-        board_t = torch.as_tensor(
-            board_2d, dtype=torch.float32, device=self.device
-        ).unsqueeze(0)                                         # (1, 1, H, W)
-        piece_t = torch.as_tensor(
-            piece_vec, dtype=torch.float32, device=self.device
-        ).unsqueeze(0)                                         # (1, 14)
-
+        # Policy forward pass
         with torch.no_grad():
-            logits = self.policy(board_t, piece_t)             # (1, act_dim)
+            if self.policy_type == "cnn":
+                assert env is not None, (
+                    "PPOAgent with CNN policy requires env for get_cnn_obs()"
+                )
+                board_2d, piece_vec = env.get_cnn_obs()
+                board_t = torch.as_tensor(
+                    board_2d, dtype=torch.float32, device=self.device
+                ).unsqueeze(0)                                     # (1, 1, H, W)
+                piece_t = torch.as_tensor(
+                    piece_vec, dtype=torch.float32, device=self.device
+                ).unsqueeze(0)                                     # (1, 14)
+                logits = self.policy(board_t, piece_t)             # (1, act_dim)
+            else:
+                obs_t = torch.as_tensor(
+                    obs, dtype=torch.float32, device=self.device
+                ).unsqueeze(0)                                     # (1, obs_dim)
+                logits = self.policy(obs_t)                        # (1, act_dim)
 
         # Mask illegal actions
         mask_t = torch.as_tensor(mask, dtype=torch.float32, device=self.device)
@@ -523,7 +572,10 @@ class PPOAgent:
     def update(self, buffer: RolloutBuffer, last_value: float = 0.0) -> dict:
         obs_t, act_t, rew_t, done_t, old_lp_t, val_t, mask_t = \
             buffer.to_tensors(self.device)
-        board_t, piece_t = buffer.cnn_tensors(self.device)
+
+        # CNN tensors only needed for CNN policy
+        if self.policy_type == "cnn":
+            board_t, piece_t = buffer.cnn_tensors(self.device)
 
         # ── GAE ───────────────────────────────────────────────
         advantages, returns = compute_gae(
@@ -541,6 +593,10 @@ class PPOAgent:
 
         # ── Normalise advantages ──────────────────────────────
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # ── Linear value: fit once (closed-form) before epochs ─
+        if self.value_type == "linear":
+            self.value.fit(obs_t.cpu().numpy(), returns.cpu().numpy())
 
         # ── PPO policy + value update (multiple epochs) ──────
         N = len(obs_t)
@@ -566,8 +622,11 @@ class PPOAgent:
                 end = start + self.minibatch_size
                 mb = indices[start:end]
 
-                # Forward through CNN policy
-                logits = self.policy(board_t[mb], piece_t[mb])
+                # Forward through policy
+                if self.policy_type == "cnn":
+                    logits = self.policy(board_t[mb], piece_t[mb])
+                else:
+                    logits = self.policy(obs_t[mb])
 
                 # Mask illegal actions
                 logits = logits + (1 - mask_t[mb]) * (-1e8)
@@ -585,7 +644,7 @@ class PPOAgent:
                 ) * mb_adv
                 pg_loss = -torch.min(surr1, surr2).mean()
 
-                # Policy loss only — no vf_loss through the CNN!
+                # Policy loss only — value has its own backward
                 loss = pg_loss - self.ent_coef * entropy
 
                 self.optimizer.zero_grad()
@@ -593,8 +652,17 @@ class PPOAgent:
                 gn = nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
                 self.optimizer.step()
 
-                # Value update (separate optimizer, separate backward)
-                vf_loss = self.value.train_on_batch(obs_t[mb], returns[mb])
+                # Value update
+                if self.value_type == "mlp":
+                    vf_loss = self.value.train_on_batch(obs_t[mb], returns[mb])
+                else:
+                    # Linear: already fit above; compute residual MSE for logging
+                    with torch.no_grad():
+                        pred = torch.as_tensor(
+                            self.value.predict(obs_t[mb].cpu().numpy()),
+                            device=self.device,
+                        )
+                        vf_loss = ((pred - returns[mb]) ** 2).mean().item()
 
                 # Accumulate diagnostics
                 approx_kl_mb = (old_lp_t[mb] - new_lp).mean().item()
