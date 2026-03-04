@@ -632,6 +632,7 @@ project_2/
 |   |-- visualize.py
 |   +-- diagnose.py
 |-- checkpoints/                # Saved model weights
+|-- pics/                       # Curated report PNG/GIF assets for README
 |-- gifs/                       # Visualisations and gameplay GIFs
 |-- logs/                       # Training metrics (JSON)
 +-- final_report.md             # This document
@@ -711,6 +712,18 @@ This section summarises the latest generated reports and plots in this repo:
 | PPO (CNN + linear value) | 162.63 | 3.79 | 84.56 | 2.70 |
 | PPO (CNN + MLP value) | 337.63 | 5.89 | 266.06 | 5.50 |
 
+REINFORCE core curves:
+
+![REINFORCE core curves](pics/reinforce_core_training_curves.png)
+
+PPO (CNN + linear value) core curves:
+
+![PPO CNN linear core curves](pics/ppo_cnn_linear_core_training_curves.png)
+
+PPO (CNN + MLP value) core curves:
+
+![PPO CNN MLP core curves](pics/ppo_cnn_mlp_core_training_curves.png)
+
 ### 11.2 What Changed When Switching Linear -> MLP Critic (PPO)
 
 Keeping PPO policy as CNN and replacing only the critic architecture in the compared runs:
@@ -729,6 +742,20 @@ Critic/stability diagnostics also improved:
 - Clip fraction (last): `0.315 -> 0.118`.
 - Ratio max (last): `8.37 -> 4.40`.
 
+Linear-critic diagnostics:
+
+![PPO CNN linear diagnostics](pics/ppo_cnn_linear_diagnostics.png)
+
+MLP-critic diagnostics:
+
+![PPO CNN MLP diagnostics](pics/ppo_cnn_mlp_diagnostics.png)
+
+Value calibration (linear critic vs MLP critic):
+
+![PPO CNN linear value calibration](pics/ppo_cnn_linear_value_calibration.png)
+
+![PPO CNN MLP value calibration](pics/ppo_cnn_mlp_value_calibration.png)
+
 ### 11.3 Plot-Based Observations (Current Run)
 
 From the latest core/diagnostic plots:
@@ -739,6 +766,12 @@ From the latest core/diagnostic plots:
 - Entropy decays gradually (toward ~1.0), while KL and clip fraction remain in a conservative range for most late iterations.
 - Top-out rate remains high (~0.91), so there is still significant room to improve board safety and long-horizon stability.
 
+Reward decomposition (linear critic vs MLP critic):
+
+![PPO CNN linear reward decomposition](pics/ppo_cnn_linear_reward_decomposition.png)
+
+![PPO CNN MLP reward decomposition](pics/ppo_cnn_mlp_reward_decomposition.png)
+
 ### 11.4 Storytelling Assets Generated
 
 The report pipeline now saves comparison GIFs for qualitative analysis:
@@ -747,3 +780,11 @@ The report pipeline now saves comparison GIFs for qualitative analysis:
 - `gif_reinforce_vs_ppo.gif`
 
 These are embedded directly in report markdown and are generated with a median-performance seed by default for less cherry-picked storytelling.
+
+Random vs REINFORCE (median-seed style storytelling run):
+
+![Random vs REINFORCE GIF](pics/gif_random_vs_reinforce_ppo_report.gif)
+
+REINFORCE vs PPO:
+
+![REINFORCE vs PPO GIF](pics/gif_reinforce_vs_ppo_ppo_report.gif)
