@@ -238,20 +238,67 @@ The quadratic bonus $n^2$ for line clears rewards multi-line clears disproportio
 
 ## 5. Development History -- Iteration by Iteration
 
-### 5.1 Iteration 1: Initial Implementation & Validation
+### 5.1 Iteration 1: Building the Environment & REINFORCE from Scratch
 
-**What we did:** Read and validated all source files (`tetris_env.py`, `agents.py`) for correctness.
+**What we did:** Built the entire Tetris RL system from the ground up -- environment, agents, and training loop.
 
-**Environment findings:**
-- Documentation incorrectly stated 33-dim observation (actual: 35) and 34 max actions (actual: piece-dependent, up to 34)
-- Dead code in random action selection (unreachable branch)
-- **No bugs** in environment logic
+**Environment (`TetrisLiteEnv`):**
+- 6-column, 20-row board with 7 standard tetrominoes and a rotation system
+- Engineered a 35-dimensional observation vector: column heights, hole counts, bottom-row fills, scalar board stats, and one-hot piece encodings -- all normalised to $[0, 1]$
+- Delta-based reward shaping (penalties on *changes* in board metrics, not absolutes)
+- Discrete action space: each action is a (rotation, column) pair, up to 34 per piece
 
-**Agent findings:**
-- REINFORCE implementation was correct
-- **Critical bug in PPO**: GAE bootstrapping (see next iteration)
+**REINFORCE agent:**
+- Shared MLP backbone (three 256-unit hidden layers with ReLU) splitting into policy (logits) and value (scalar) heads
+- Monte Carlo returns with mean-return baseline for variance reduction
+- Entropy bonus to encourage exploration
+- Epsilon-greedy schedule annealed over training
 
-### 5.2 Iteration 2: GAE Bootstrap Bug Fix
+**Result:** The agent could play Tetris and survive for short episodes, but learning was slow and unstable. REINFORCE's high variance (full Monte Carlo returns, one trajectory at a time) made progress difficult.
+
+### 5.2 Iteration 2: PPO with Shared MLP Backbone
+
+**Motivation:** REINFORCE uses each trajectory exactly once and has high variance. PPO promises lower variance through GAE advantage estimation, stable updates via clipping, and better sample efficiency through multiple epochs of minibatch updates.
+
+**What we did:** Implemented PPO on top of the same shared MLP backbone used by REINFORCE:
+- Generalised Advantage Estimation (GAE) with $\lambda = 0.95$
+- Clipped surrogate objective with $\epsilon = 0.2$
+- 4 epochs of minibatch updates per rollout
+- 4096-step rollout buffer with multi-episode collection
+
+**Result:** Training was highly unstable -- erratic value loss, poor learning signal, and the policy was not improving meaningfully. This led us to investigate the reward function and the implementation.
+
+### 5.3 Iteration 3: Reward Scale Problem
+
+**Symptom:** PPO training showed extremely poor learning -- high-variance returns and an unstable value function. The agent was barely improving despite using a more sophisticated algorithm than REINFORCE.
+
+**Diagnosis:** The original reward weights were tuned for a 10-wide Tetris board but our board is only 6 columns wide:
+
+| Weight | Original (10-wide) | Problem on 6-wide |
+|--------|-------------------|--------------------|
+| `line_clear_scale` | 200 | Creates return range $[-408, +716]$ |
+| `hole_penalty` | 4.0 | Too punitive -- holes are frequent on narrow board |
+| `bumpiness_penalty` | 1.0 | Excessively large for 6 columns |
+
+**Consequence:** Value loss ranged from 10,000 to 45,000. Through the shared backbone, the value gradient dominated:
+
+$$\|\nabla_\theta \mathcal{L}_{\text{value}}\| \gg \|\nabla_\theta \mathcal{L}_{\text{policy}}\|$$
+
+The policy was barely learning -- its gradients were washed out.
+
+**Fix:** Reduced all weights proportionally:
+
+| Weight | Before | After |
+|--------|--------|-------|
+| `line_clear_scale` | 200 | 30 |
+| `hole_penalty` | 4.0 | 1.5 |
+| `bumpiness_penalty` | 1.0 | 0.3 |
+| `height_penalty` | 1.0 | 0.3 |
+| `game_over_penalty` | 10.0 | 10.0 |
+
+**Result:** Value loss dropped approximately $23\times$. Training became more stable.
+
+### 5.4 Iteration 4: GAE Bootstrap Bug Fix
 
 **The bug:** When a rollout was truncated mid-episode (the rollout budget of 4096 steps was exhausted before the episode ended), `compute_gae()` was called with `last_value = 0.0`:
 
@@ -277,39 +324,9 @@ stats = agent.update(buf, last_value=last_val)
 
 **Verification:** Advantage at truncation boundary changed from $-49.0$ (buggy) to $+0.5$ (correct).
 
-### 5.3 Iteration 3: Reward Scale Problem
+### 5.5 Iteration 5: Entropy Collapse
 
-**Symptom:** After fixing the bootstrap bug, training plots showed extremely poor learning -- high-variance returns and an unstable value function.
-
-**Diagnosis:** The original reward weights were tuned for a 10-wide Tetris board but our board is only 6 columns wide:
-
-| Weight | Original (10-wide) | Problem on 6-wide |
-|--------|-------------------|--------------------|
-| `line_clear_scale` | 200 | Creates return range $[-408, +716]$ |
-| `hole_penalty` | 4.0 | Too punitive -- holes are frequent on narrow board |
-| `bumpiness_penalty` | 1.0 | Excessively large for 6 columns |
-
-**Consequence:** Value loss ranged from 10,000 to 45,000. Through the shared backbone, the value gradient dominated:
-
-$$\|\nabla_\theta \mathcal{L}_{\text{value}}\| \gg \|\nabla_\theta \mathcal{L}_{\text{policy}}\|$$
-
-The policy was barely learning -- its gradients were washed out.
-
-**Fix (first pass):** Reduced all weights proportionally:
-
-| Weight | Before | After |
-|--------|--------|-------|
-| `line_clear_scale` | 200 | 30 |
-| `hole_penalty` | 4.0 | 1.5 |
-| `bumpiness_penalty` | 1.0 | 0.3 |
-| `height_penalty` | 1.0 | 0.3 |
-| `game_over_penalty` | 10.0 | 10.0 |
-
-**Result:** Value loss dropped approximately $23\times$. Training became more stable.
-
-### 5.4 Iteration 4: Entropy Collapse
-
-**Symptom:** After the reward fix, entropy collapsed from $\sim 2.5$ to $\sim 0.2$ by iteration 75. The policy was converging to a near-deterministic strategy far too early.
+**Symptom:** After fixing the reward weights and the GAE bootstrap bug, entropy collapsed from $\sim 2.5$ to $\sim 0.2$ by iteration 75. The policy was converging to a near-deterministic strategy far too early.
 
 **Root cause -- gradient magnitude analysis:**
 
@@ -337,7 +354,7 @@ $$\|c_v \cdot \nabla \mathcal{L}_v\| \approx 0.5 \times 150 = 75$$
 | `ENT_END` | 0.005 | 0.02 | Maintain meaningful exploration throughout |
 | `vf_coef` | 0.5 | 0.25 | Halve the value gradient magnitude |
 
-### 5.5 Iteration 5: Architectural Separation -- CNN Policy + Separate Value
+### 5.6 Iteration 6: Architectural Separation -- CNN Policy + Separate Value
 
 **Motivation:** Even after rebalancing coefficients, the shared backbone remained fundamentally problematic -- value and policy gradients compete for the same parameters. This is a well-known issue in actor-critic methods.
 
@@ -360,7 +377,7 @@ An MLP on the 35-dim engineered features loses this spatial structure.
 
 **Result:** Line clear scale increased from 30 to 60 (now feasible with separated architecture). Training stabilised.
 
-### 5.6 Iteration 6: MPS Backend Attempt and Reversion
+### 5.7 Iteration 7: MPS Backend Attempt and Reversion
 
 **Motivation:** Apple Silicon (M-series) Macs have the MPS backend for GPU-accelerated PyTorch. We investigated whether it could accelerate training.
 
@@ -376,7 +393,7 @@ An MLP on the 35-dim engineered features loses this spatial structure.
 
 **Lesson:** GPU acceleration requires batch parallelism. Per-step RL inference (single observation $\to$ single action) is inherently sequential and sync-bound on GPU backends.
 
-### 5.7 Iteration 7: Performance Optimisation -- Height-Map Collision Detection
+### 5.8 Iteration 8: Performance Optimisation -- Height-Map Collision Detection
 
 **Motivation:** Profiling revealed that `_can_place()` was the most expensive function in the rollout loop. Called once per action per step (up to 34 actions $\times$ 4096 steps = 140,000 calls per iteration), it used $O(H)$ column scanning for each collision check.
 
@@ -409,7 +426,7 @@ An MLP on the 35-dim engineered features loses this spatial structure.
 
 **Result:** Rollout time dropped from 2.06s to 0.30s (7$\times$ faster).
 
-### 5.8 Iteration 8: MLP Value Estimator (Nonlinear Critic)
+### 5.9 Iteration 9: MLP Value Estimator (Nonlinear Critic)
 
 **Motivation:** The linear value estimator $V(s) = \mathbf{w}^\top\phi(s) + b$ cannot capture nonlinear value patterns. As the agent improves and board states become more varied, a linear model may underfit the value landscape.
 
@@ -430,7 +447,7 @@ obs(35) --> Linear(35, 128) --> ReLU --> Linear(128, 64) --> ReLU --> Linear(64,
 
 This lets the MLP value estimator see each minibatch multiple times across epochs, gradually fitting the value landscape.
 
-### 5.9 Iteration 9: Target-KL Early Stopping
+### 5.10 Iteration 10: Target-KL Early Stopping
 
 **Motivation:** Late in training when entropy drops, PPO updates can become too aggressive -- large policy changes that destabilise learning.
 
@@ -448,7 +465,7 @@ for epoch in range(self.epochs):
 
 The diagnostic `epochs_completed` is logged per iteration, showing when early stopping fires. When it reports 2 or 3 instead of the full 4, the mechanism is actively protecting the policy.
 
-### 5.10 Iteration 10: Per-Step Reward Normalisation
+### 5.11 Iteration 11: Per-Step Reward Normalisation
 
 **Problem:** Reward decomposition plots (line clear reward, hole penalty, etc.) showed per-episode *totals*. But episodes vary enormously in length (5--500 steps), so a 200-step episode accumulates $\sim 40\times$ more survival reward than a 5-step episode. The plots reflected episode length, not agent behaviour.
 
@@ -458,7 +475,7 @@ $$r^{\text{norm}}_k = \frac{\sum_{t=0}^{T} r_{k,t}}{T}$$
 
 This gives the **per-step mean** of each component, making episodes of different lengths directly comparable. Plot titles updated to "per-step mean" to reflect the change.
 
-### 5.11 Iteration 11: MLP Policy + Configurable Architecture
+### 5.12 Iteration 12: MLP Policy + Configurable Architecture
 
 **Motivation:** The CNN policy, while powerful, is not always necessary. For rapid experimentation or ablation studies, an MLP policy on the flat 35-dim features is simpler, faster, and avoids the overhead of storing/processing 2D board tensors.
 
@@ -495,9 +512,9 @@ This gives the **per-step mean** of each component, making episodes of different
 | MLP | MLP | Tested, faster per step |
 | MLP | Linear | Tested, simplest/fastest configuration |
 
-### 5.12 Iteration 12: Comprehensive Diagnostics & Visualisations
+### 5.13 Comprehensive Diagnostics & Visualisations
 
-Throughout iterations 5--11, a comprehensive diagnostics system was built:
+Throughout the project, a comprehensive diagnostics system was built incrementally:
 
 **New metrics added:**
 - **Line-clear composition:** singles, doubles, triples, quads tracked separately per iteration
@@ -533,7 +550,7 @@ Throughout iterations 5--11, a comprehensive diagnostics system was built:
 | Evaluation boxplot | 50-episode boxplot: Random vs REINFORCE vs PPO |
 | Animated learning curve | Learning curve being drawn over time |
 
-### 5.13 Bug Fixes Along the Way
+### 5.14 Bug Fixes Along the Way
 
 **MPS device mismatch in `compute_gae`:**
 GAE computation mixed MPS and CPU tensors. Fixed by forcing all inputs to CPU at the start of `compute_gae()` (caller moves results to the appropriate device afterwards).
@@ -659,18 +676,18 @@ python train.py --policy cnn --value linear
 
 | Iter | Change | Outcome | Status |
 |------|--------|---------|--------|
-| 1 | Initial validation | Found doc errors, dead code, no env bugs | Baseline |
-| 2 | Fix GAE bootstrap (`last_value = 0.0` $\to$ `V(s_{T+1})`) | Advantage at boundary: $-49 \to +0.5$ | **Bug fixed** |
-| 3 | Retune reward weights for 6-wide board | Value loss dropped $\sim 23\times$ | **Improved** |
-| 4 | Increase entropy coef ($0.05 \to 0.20$), reduce `vf_coef` ($0.5 \to 0.25$) | Prevented entropy collapse | **Improved** |
-| 5 | Separate CNN policy + linear value (no shared backbone) | Eliminated gradient conflict entirely | **Architectural fix** |
-| 6 | Attempt MPS GPU acceleration | CPU faster due to per-step sync overhead; **reverted** | **Failed, reverted** |
-| 7 | Height-map collision detection (`_can_place_fast`) | Rollout 7$\times$ faster (2.06s $\to$ 0.30s) | **Optimisation** |
-| 8 | Replace linear value with MLP value estimator | Nonlinear V(s), trained with Adam per minibatch | **Upgraded** |
-| 9 | Target-KL early stopping ($\text{KL}_{\text{target}} = 0.02$) | Conservative late-training updates | **Stabilisation** |
-| 10 | Per-step reward normalisation in diagnostics | Comparable across episode lengths | **Diagnostic fix** |
-| 11 | Add MLP policy option + CLI flags (`--policy`, `--value`) | 4 configurable architecture combos | **Flexibility** |
-| 12 | Comprehensive diagnostics (23 plots, fixed-seed eval, value calibration) | Full observability into training dynamics | **Instrumentation** |
+| 1 | Built environment & REINFORCE from scratch | Working Tetris MDP, Monte Carlo policy gradient baseline | Baseline |
+| 2 | Implemented PPO with shared MLP backbone | GAE, clipping, multi-epoch updates; training unstable | Foundation |
+| 3 | Retune reward weights for 6-wide board | Value loss dropped $\sim 23\times$; hole penalty 4.0 $\to$ 1.5 | **Improved** |
+| 4 | Fix GAE bootstrap (`last_value = 0.0` $\to$ `V(s_{T+1})`) | Advantage at boundary: $-49 \to +0.5$ | **Bug fixed** |
+| 5 | Increase entropy coef ($0.05 \to 0.20$), reduce `vf_coef` ($0.5 \to 0.25$) | Prevented entropy collapse | **Improved** |
+| 6 | Separate CNN policy + linear value (no shared backbone) | Eliminated gradient conflict entirely | **Architectural fix** |
+| 7 | Attempt MPS GPU acceleration | CPU faster due to per-step sync overhead; **reverted** | **Failed, reverted** |
+| 8 | Height-map collision detection (`_can_place_fast`) | Rollout 7$\times$ faster (2.06s $\to$ 0.30s) | **Optimisation** |
+| 9 | Replace linear value with MLP value estimator | Nonlinear V(s), trained with Adam per minibatch | **Upgraded** |
+| 10 | Target-KL early stopping ($\text{KL}_{\text{target}} = 0.02$) | Conservative late-training updates | **Stabilisation** |
+| 11 | Per-step reward normalisation in diagnostics | Comparable across episode lengths | **Diagnostic fix** |
+| 12 | Add MLP policy option + CLI flags (`--policy`, `--value`) | 4 configurable architecture combos | **Flexibility** |
 
 ---
 
