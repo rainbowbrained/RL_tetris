@@ -696,15 +696,15 @@ python train.py --policy cnn --value linear
 
 ---
 
-## 11. Latest Empirical Snapshot (2026-03-04)
+## 11. Plots and data 
 
-This section summarises the latest generated reports and plots in this repo:
+This section summarises the generated reports and plots in this repo:
 
 - `reports/reinforce_report_value_mlp/report.md`
 - `reports/ppo_report/report.md` (PPO CNN + linear value)
 - `reports/ppo_report_value_mlp/report.md` (PPO CNN + MLP value)
 
-### 11.1 Headline Comparison (last-iteration metrics)
+### 11.1 Headline Comparison
 
 | Model | Reward (last) | Lines (last) | Fixed eval reward (last) | Fixed eval lines (last) |
 |------|---------------:|-------------:|--------------------------:|------------------------:|
