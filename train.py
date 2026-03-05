@@ -218,17 +218,21 @@ def train_reinforce():
 
 
 def train_ppo(policy_type="cnn", value_type="mlp"):
-    N_ITERS       = 300
+    N_ITERS       = 1500
     ROLLOUT_STEPS = 4096
     LR            = 3e-4
+    LR_LATE       = 1e-4
     GAMMA         = 0.99
     LAM           = 0.95
     CLIP_EPS      = 0.2
     EPOCHS        = 4
+    EPOCHS_LATE   = 2
     MINIBATCH     = 256
     N_FILTERS     = 32
     VALUE_LR      = 1e-3
+    VALUE_LR_LATE = 3e-4
     TARGET_KL     = 0.02
+    LATE_PHASE_START = 1000
     ENT_START, ENT_END = 0.20, 0.02
     SNAPSHOT_EVERY = 50
     FIXED_EVAL_EVERY = 50
@@ -269,10 +273,25 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
     }
     snapshots = []
 
+    late_phase_entered = False
+
     pbar = tqdm(range(1, N_ITERS + 1), desc="PPO")
     for it in pbar:
         progress = it / N_ITERS
         agent.ent_coef = ENT_START + (ENT_END - ENT_START) * progress
+
+        if it > LATE_PHASE_START and not late_phase_entered:
+            late_phase_entered = True
+            for pg in agent.optimizer.param_groups:
+                pg["lr"] = LR_LATE
+            if value_type == "mlp":
+                for pg in agent.value.optimizer.param_groups:
+                    pg["lr"] = VALUE_LR_LATE
+            agent.epochs = EPOCHS_LATE
+            tqdm.write(
+                f"[iter {it}] Late phase: policy_lr={LR_LATE}, "
+                f"value_lr={VALUE_LR_LATE}, epochs={EPOCHS_LATE}"
+            )
 
         buf = RolloutBuffer()
         obs = env.reset()
@@ -424,11 +443,14 @@ def train_ppo(policy_type="cnn", value_type="mlp"):
             pbar.set_postfix(rew=f"{np.mean(recent):.1f}", ent=f"{stats['entropy']:.3f}")
 
     hyperparams = {
-        "lr": LR, "gamma": GAMMA, "lam": LAM, "clip_eps": CLIP_EPS,
-        "epochs": EPOCHS, "minibatch_size": MINIBATCH, "hidden": HIDDEN,
+        "lr": LR, "lr_late": LR_LATE,
+        "gamma": GAMMA, "lam": LAM, "clip_eps": CLIP_EPS,
+        "epochs": EPOCHS, "epochs_late": EPOCHS_LATE,
+        "minibatch_size": MINIBATCH, "hidden": HIDDEN,
         "n_filters": N_FILTERS, "ent_start": ENT_START, "ent_end": ENT_END,
         "n_iters": N_ITERS, "rollout_steps": ROLLOUT_STEPS,
-        "value_lr": VALUE_LR, "target_kl": TARGET_KL,
+        "value_lr": VALUE_LR, "value_lr_late": VALUE_LR_LATE,
+        "target_kl": TARGET_KL, "late_phase_start": LATE_PHASE_START,
         "policy_type": policy_type, "value_type": value_type,
     }
     return agent, metrics, snapshots, hyperparams
